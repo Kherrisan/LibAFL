@@ -4,33 +4,11 @@
 #![doc = include_str!("../README.md")]
 /*! */
 #![cfg_attr(feature = "document-features", doc = document_features::document_features!())]
-#![allow(incomplete_features)]
 #![no_std]
 // For `type_eq`
 #![cfg_attr(nightly, feature(specialization))]
 // For `std::simd`
 #![cfg_attr(nightly, feature(portable_simd))]
-// For `core::error`
-#![cfg_attr(nightly, feature(error_in_core))]
-#![warn(clippy::cargo)]
-#![allow(ambiguous_glob_reexports)]
-#![deny(clippy::cargo_common_metadata)]
-#![deny(rustdoc::broken_intra_doc_links)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-#![allow(
-    clippy::unreadable_literal,
-    clippy::type_repetition_in_bounds,
-    clippy::missing_errors_doc,
-    clippy::cast_possible_truncation,
-    clippy::used_underscore_binding,
-    clippy::ptr_as_ptr,
-    clippy::missing_panics_doc,
-    clippy::missing_docs_in_private_items,
-    clippy::module_name_repetitions,
-    clippy::ptr_cast_constness,
-    clippy::negative_feature_names
-)]
 #![cfg_attr(not(test), warn(
     missing_debug_implementations,
     missing_docs,
@@ -71,16 +49,15 @@
         while_true
     )
 )]
-// Till they fix this buggy lint in clippy
-#![allow(clippy::borrow_as_ptr)]
-#![allow(clippy::borrow_deref_ref)]
 
 /// We need some sort of "[`String`]" for errors in `no_alloc`...
 /// We can only support `'static` without allocator, so let's do that.
 #[cfg(not(feature = "alloc"))]
 type String = &'static str;
 
-/// We also need a non-allocating format...
+/// A simple non-allocating "format" string wrapper for no-std.
+///
+/// Problem is that we really need a non-allocating format...
 /// This one simply returns the `fmt` string.
 /// Good enough for simple errors, for anything else, use the `alloc` feature.
 #[cfg(not(feature = "alloc"))]
@@ -120,7 +97,7 @@ pub mod fs;
 #[cfg(feature = "alloc")]
 pub mod llmp;
 pub mod math;
-#[cfg(all(feature = "std", unix))]
+#[cfg(feature = "std")]
 pub mod minibsod;
 pub mod os;
 #[cfg(feature = "alloc")]
@@ -131,6 +108,8 @@ pub mod serdeany;
 pub mod shmem;
 #[cfg(feature = "std")]
 pub mod staterestore;
+#[cfg(feature = "alloc")]
+pub mod subrange;
 // TODO: reenable once ahash works in no-alloc
 #[cfg(any(feature = "xxh3", feature = "alloc"))]
 pub mod tuples;
@@ -163,13 +142,11 @@ pub mod bolts_prelude {
 #[cfg(all(unix, feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(feature = "alloc")]
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 #[cfg(all(not(feature = "xxh3"), feature = "alloc"))]
 use core::hash::BuildHasher;
 #[cfg(any(feature = "xxh3", feature = "alloc"))]
-use core::hash::Hasher;
-#[cfg(all(unix, feature = "std"))]
-use core::ptr;
+use core::hash::{Hash, Hasher};
 #[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(unix, feature = "std"))]
@@ -197,21 +174,11 @@ use xxhash_rust::xxh3::xxh3_64;
 )]
 pub struct ClientId(pub u32);
 
-#[cfg(feature = "std")]
-use log::{Metadata, Record};
-
-#[deprecated(
-    since = "0.11.0",
-    note = "The launcher module has moved out of `libafl_bolts` into `libafl::events::launcher`."
-)]
-/// Dummy module informing potential users that the launcher module has moved
-/// out of `libafl_bolts` into `libafl::events::launcher`.
-pub mod launcher {}
-
 use core::{
     array::TryFromSliceError,
     fmt::{self, Display},
     num::{ParseIntError, TryFromIntError},
+    ops::{Deref, DerefMut},
     time,
 };
 #[cfg(feature = "std")]
@@ -219,6 +186,8 @@ use std::{env::VarError, io};
 
 #[cfg(feature = "libafl_derive")]
 pub use libafl_derive::SerdeAny;
+#[cfg(feature = "std")]
+use log::{Metadata, Record};
 #[cfg(feature = "alloc")]
 use {
     alloc::string::{FromUtf8Error, String},
@@ -226,10 +195,14 @@ use {
     core::str::Utf8Error,
 };
 
+/// Localhost addr, this is used, for example, for LLMP Client, which connects to this address
+pub const IP_LOCALHOST: &str = "127.0.0.1";
+
 /// We need fixed names for many parts of this lib.
+#[cfg(feature = "alloc")]
 pub trait Named {
     /// Provide the name of this element.
-    fn name(&self) -> &str;
+    fn name(&self) -> &Cow<'static, str>;
 }
 
 #[cfg(feature = "errors_backtrace")]
@@ -238,14 +211,15 @@ pub type ErrorBacktrace = backtrace::Backtrace;
 
 #[cfg(not(feature = "errors_backtrace"))]
 #[derive(Debug, Default)]
-/// Empty struct to use when `errors_backtrace` is disabled
-pub struct ErrorBacktrace {}
+/// ZST to use when `errors_backtrace` is disabled
+pub struct ErrorBacktrace;
+
 #[cfg(not(feature = "errors_backtrace"))]
 impl ErrorBacktrace {
     /// Nop
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self
     }
 }
 
@@ -254,11 +228,13 @@ fn display_error_backtrace(f: &mut fmt::Formatter, err: &ErrorBacktrace) -> fmt:
     write!(f, "\nBacktrace: {err:?}")
 }
 #[cfg(not(feature = "errors_backtrace"))]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 fn display_error_backtrace(_f: &mut fmt::Formatter, _err: &ErrorBacktrace) -> fmt::Result {
     fmt::Result::Ok(())
 }
 
+/// Returns the standard input [`Hasher`]
+///
 /// Returns the hasher for the input with a given hash, depending on features:
 /// [`xxh3_64`](https://docs.rs/xxhash-rust/latest/xxhash_rust/xxh3/fn.xxh3_64.html)
 /// if the `xxh3` feature is used, /// else [`ahash`](https://docs.rs/ahash/latest/ahash/).
@@ -271,6 +247,8 @@ pub fn hasher_std() -> impl Hasher + Clone {
     RandomState::with_seeds(0, 0, 0, 0).build_hasher()
 }
 
+/// Hashes the input with a given hash
+///
 /// Hashes the input with a given hash, depending on features:
 /// [`xxh3_64`](https://docs.rs/xxhash-rust/latest/xxhash_rust/xxh3/fn.xxh3_64.html)
 /// if the `xxh3` feature is used, /// else [`ahash`](https://docs.rs/ahash/latest/ahash/).
@@ -287,6 +265,34 @@ pub fn hash_std(input: &[u8]) -> u64 {
     }
 }
 
+/// Fast hash function for 64 bits integers minimizing collisions.
+/// Adapted from <https://xorshift.di.unimi.it/splitmix64.c>
+#[must_use]
+pub fn hash_64_fast(mut x: u64) -> u64 {
+    x = (x ^ (x.overflowing_shr(30).0))
+        .overflowing_mul(0xbf58476d1ce4e5b9)
+        .0;
+    x = (x ^ (x.overflowing_shr(27).0))
+        .overflowing_mul(0x94d049bb133111eb)
+        .0;
+    x ^ (x.overflowing_shr(31).0)
+}
+
+/// Hashes the input with a given hash
+///
+/// Hashes the input with a given hash, depending on features:
+/// [`xxh3_64`](https://docs.rs/xxhash-rust/latest/xxhash_rust/xxh3/fn.xxh3_64.html)
+/// if the `xxh3` feature is used, /// else [`ahash`](https://docs.rs/ahash/latest/ahash/).
+///
+/// If you have access to a `&[u8]` directly, [`hash_std`] may provide better performance
+#[cfg(any(feature = "xxh3", feature = "alloc"))]
+#[must_use]
+pub fn generic_hash_std<I: Hash>(input: &I) -> u64 {
+    let mut hasher = hasher_std();
+    input.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Main error struct for `LibAFL`
 #[derive(Debug)]
 pub enum Error {
@@ -295,9 +301,6 @@ pub enum Error {
     /// Compression error
     #[cfg(feature = "gzip")]
     Compression(ErrorBacktrace),
-    /// File related error
-    #[cfg(feature = "std")]
-    File(io::Error, ErrorBacktrace),
     /// Optional val was supposed to be set, but isn't.
     EmptyOptional(String, ErrorBacktrace),
     /// Key not in Map
@@ -316,8 +319,15 @@ pub enum Error {
     Unsupported(String, ErrorBacktrace),
     /// Shutting down, not really an error.
     ShuttingDown,
+    /// OS error, wrapping a [`io::Error`]
+    #[cfg(feature = "std")]
+    OsError(io::Error, String, ErrorBacktrace),
     /// Something else happened
     Unknown(String, ErrorBacktrace),
+    /// Error with the corpora
+    InvalidCorpus(String, ErrorBacktrace),
+    /// Error specific to a runtime like QEMU or Frida
+    Runtime(String, ErrorBacktrace),
 }
 
 impl Error {
@@ -329,18 +339,14 @@ impl Error {
     {
         Error::Serialize(arg.into(), ErrorBacktrace::new())
     }
+
     #[cfg(feature = "gzip")]
     /// Compression error
     #[must_use]
     pub fn compression() -> Self {
         Error::Compression(ErrorBacktrace::new())
     }
-    #[cfg(feature = "std")]
-    /// File related error
-    #[must_use]
-    pub fn file(arg: io::Error) -> Self {
-        Error::File(arg, ErrorBacktrace::new())
-    }
+
     /// Optional val was supposed to be set, but isn't.
     #[must_use]
     pub fn empty_optional<S>(arg: S) -> Self
@@ -349,6 +355,7 @@ impl Error {
     {
         Error::EmptyOptional(arg.into(), ErrorBacktrace::new())
     }
+
     /// Key not in Map
     #[must_use]
     pub fn key_not_found<S>(arg: S) -> Self
@@ -357,6 +364,7 @@ impl Error {
     {
         Error::KeyNotFound(arg.into(), ErrorBacktrace::new())
     }
+
     /// No elements in the current item
     #[must_use]
     pub fn empty<S>(arg: S) -> Self
@@ -365,6 +373,7 @@ impl Error {
     {
         Error::Empty(arg.into(), ErrorBacktrace::new())
     }
+
     /// End of iteration
     #[must_use]
     pub fn iterator_end<S>(arg: S) -> Self
@@ -373,6 +382,7 @@ impl Error {
     {
         Error::IteratorEnd(arg.into(), ErrorBacktrace::new())
     }
+
     /// This is not supported (yet)
     #[must_use]
     pub fn not_implemented<S>(arg: S) -> Self
@@ -381,6 +391,7 @@ impl Error {
     {
         Error::NotImplemented(arg.into(), ErrorBacktrace::new())
     }
+
     /// You're holding it wrong
     #[must_use]
     pub fn illegal_state<S>(arg: S) -> Self
@@ -389,6 +400,7 @@ impl Error {
     {
         Error::IllegalState(arg.into(), ErrorBacktrace::new())
     }
+
     /// The argument passed to this method or function is not valid
     #[must_use]
     pub fn illegal_argument<S>(arg: S) -> Self
@@ -397,11 +409,13 @@ impl Error {
     {
         Error::IllegalArgument(arg.into(), ErrorBacktrace::new())
     }
+
     /// Shutting down, not really an error.
     #[must_use]
     pub fn shutting_down() -> Self {
         Error::ShuttingDown
     }
+
     /// This operation is not supported on the current architecture or platform
     #[must_use]
     pub fn unsupported<S>(arg: S) -> Self
@@ -410,6 +424,31 @@ impl Error {
     {
         Error::Unsupported(arg.into(), ErrorBacktrace::new())
     }
+
+    /// OS error with additional message
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn os_error<S>(err: io::Error, msg: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Error::OsError(err, msg.into(), ErrorBacktrace::new())
+    }
+
+    /// OS error from [`io::Error::last_os_error`] with additional message
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn last_os_error<S>(msg: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Error::OsError(
+            io::Error::last_os_error(),
+            msg.into(),
+            ErrorBacktrace::new(),
+        )
+    }
+
     /// Something else happened
     #[must_use]
     pub fn unknown<S>(arg: S) -> Self
@@ -417,6 +456,35 @@ impl Error {
         S: Into<String>,
     {
         Error::Unknown(arg.into(), ErrorBacktrace::new())
+    }
+
+    /// Error with corpora
+    #[must_use]
+    pub fn invalid_corpus<S>(arg: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Error::InvalidCorpus(arg.into(), ErrorBacktrace::new())
+    }
+
+    /// Error specific to some runtime, like QEMU or Frida
+    #[must_use]
+    pub fn runtime<S>(arg: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Error::Runtime(arg.into(), ErrorBacktrace::new())
+    }
+}
+
+impl core::error::Error for Error {
+    #[cfg(feature = "std")]
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        if let Self::OsError(err, _, _) = self {
+            Some(err)
+        } else {
+            None
+        }
     }
 }
 
@@ -432,17 +500,12 @@ impl Display for Error {
                 write!(f, "Error in decompression")?;
                 display_error_backtrace(f, b)
             }
-            #[cfg(feature = "std")]
-            Self::File(err, b) => {
-                write!(f, "File IO failed: {:?}", &err)?;
-                display_error_backtrace(f, b)
-            }
             Self::EmptyOptional(s, b) => {
                 write!(f, "Optional value `{0}` was not set", &s)?;
                 display_error_backtrace(f, b)
             }
             Self::KeyNotFound(s, b) => {
-                write!(f, "Key `{0}` not in Corpus", &s)?;
+                write!(f, "Key: `{0}` - not found", &s)?;
                 display_error_backtrace(f, b)
             }
             Self::Empty(s, b) => {
@@ -474,8 +537,21 @@ impl Display for Error {
                 display_error_backtrace(f, b)
             }
             Self::ShuttingDown => write!(f, "Shutting down!"),
+            #[cfg(feature = "std")]
+            Self::OsError(err, s, b) => {
+                write!(f, "OS error: {0}: {1}", &s, err)?;
+                display_error_backtrace(f, b)
+            }
             Self::Unknown(s, b) => {
                 write!(f, "Unknown error: {0}", &s)?;
+                display_error_backtrace(f, b)
+            }
+            Self::InvalidCorpus(s, b) => {
+                write!(f, "Invalid corpus: {0}", &s)?;
+                display_error_backtrace(f, b)
+            }
+            Self::Runtime(s, b) => {
+                write!(f, "Runtime error: {0}", &s)?;
                 display_error_backtrace(f, b)
             }
         }
@@ -508,14 +584,6 @@ impl From<postcard::Error> for Error {
     }
 }
 
-/// Stringify the json serializer error
-#[cfg(feature = "std")]
-impl From<serde_json::Error> for Error {
-    fn from(err: serde_json::Error) -> Self {
-        Self::serialize(format!("{err:?}"))
-    }
-}
-
 #[cfg(all(unix, feature = "std"))]
 impl From<nix::Error> for Error {
     fn from(err: nix::Error) -> Self {
@@ -527,13 +595,12 @@ impl From<nix::Error> for Error {
 #[cfg(feature = "std")]
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
-        Self::file(err)
+        Self::os_error(err, "io::Error ocurred")
     }
 }
 
 #[cfg(feature = "alloc")]
 impl From<FromUtf8Error> for Error {
-    #[allow(unused_variables)]
     fn from(err: FromUtf8Error) -> Self {
         Self::unknown(format!("Could not convert byte / utf-8: {err:?}"))
     }
@@ -541,7 +608,6 @@ impl From<FromUtf8Error> for Error {
 
 #[cfg(feature = "alloc")]
 impl From<Utf8Error> for Error {
-    #[allow(unused_variables)]
     fn from(err: Utf8Error) -> Self {
         Self::unknown(format!("Could not convert byte / utf-8: {err:?}"))
     }
@@ -549,44 +615,43 @@ impl From<Utf8Error> for Error {
 
 #[cfg(feature = "std")]
 impl From<VarError> for Error {
-    #[allow(unused_variables)]
     fn from(err: VarError) -> Self {
         Self::empty(format!("Could not get env var: {err:?}"))
     }
 }
 
 impl From<ParseIntError> for Error {
-    #[allow(unused_variables)]
+    #[allow(unused_variables)] // err is unused without std
     fn from(err: ParseIntError) -> Self {
         Self::unknown(format!("Failed to parse Int: {err:?}"))
     }
 }
 
 impl From<TryFromIntError> for Error {
-    #[allow(unused_variables)]
+    #[allow(unused_variables)] // err is unused without std
     fn from(err: TryFromIntError) -> Self {
         Self::illegal_state(format!("Expected conversion failed: {err:?}"))
     }
 }
 
 impl From<TryFromSliceError> for Error {
-    #[allow(unused_variables)]
+    #[allow(unused_variables)] // err is unused without std
     fn from(err: TryFromSliceError) -> Self {
         Self::illegal_argument(format!("Could not convert slice: {err:?}"))
     }
 }
 
 impl From<SetLoggerError> for Error {
-    #[allow(unused_variables)]
+    #[allow(unused_variables)] // err is unused without std
     fn from(err: SetLoggerError) -> Self {
         Self::illegal_state(format!("Failed to register logger: {err:?}"))
     }
 }
 
 #[cfg(windows)]
-impl From<windows::core::Error> for Error {
-    #[allow(unused_variables)]
-    fn from(err: windows::core::Error) -> Self {
+impl From<windows_result::Error> for Error {
+    #[allow(unused_variables)] // err is unused without std
+    fn from(err: windows_result::Error) -> Self {
         Self::unknown(format!("Windows API error: {err:?}"))
     }
 }
@@ -595,10 +660,13 @@ impl From<windows::core::Error> for Error {
 impl From<pyo3::PyErr> for Error {
     fn from(err: pyo3::PyErr) -> Self {
         pyo3::Python::with_gil(|py| {
-            if err.matches(
-                py,
-                pyo3::types::PyType::new::<pyo3::exceptions::PyKeyboardInterrupt>(py),
-            ) {
+            if err
+                .matches(
+                    py,
+                    pyo3::types::PyType::new::<pyo3::exceptions::PyKeyboardInterrupt>(py),
+                )
+                .unwrap()
+            {
                 Self::shutting_down()
             } else {
                 Self::illegal_state(format!("Python exception: {err:?}"))
@@ -607,15 +675,11 @@ impl From<pyo3::PyErr> for Error {
     }
 }
 
-#[cfg(all(not(nightly), feature = "std"))]
-impl std::error::Error for Error {}
-
-#[cfg(nightly)]
-impl core::error::Error for Error {}
-
 /// The purpose of this module is to alleviate imports of many components by adding a glob import.
 #[cfg(feature = "prelude")]
 pub mod prelude {
+    #![allow(ambiguous_glob_reexports)]
+
     pub use super::{bolts_prelude::*, *};
 }
 
@@ -639,68 +703,92 @@ pub trait IntoOwned {
 }
 
 /// Can be converted to a slice
-pub trait AsSlice {
-    /// Type of the entries in this slice
-    type Entry;
+pub trait AsSlice<'a> {
+    /// Type of the entries of this slice
+    type Entry: 'a;
+    /// Type of the reference to this slice
+    type SliceRef: Deref<Target = [Self::Entry]>;
+
     /// Convert to a slice
-    fn as_slice(&self) -> &[Self::Entry];
+    fn as_slice(&'a self) -> Self::SliceRef;
+}
+
+/// Can be converted to a slice
+pub trait AsSizedSlice<'a, const N: usize> {
+    /// Type of the entries of this slice
+    type Entry: 'a;
+    /// Type of the reference to this slice
+    type SliceRef: Deref<Target = [Self::Entry; N]>;
+
+    /// Convert to a slice
+    fn as_sized_slice(&'a self) -> Self::SliceRef;
+}
+
+impl<'a, T, R: ?Sized> AsSlice<'a> for R
+where
+    T: 'a,
+    R: Deref<Target = [T]>,
+{
+    type Entry = T;
+    type SliceRef = &'a [T];
+
+    fn as_slice(&'a self) -> Self::SliceRef {
+        self
+    }
+}
+
+impl<'a, T, const N: usize, R: ?Sized> AsSizedSlice<'a, N> for R
+where
+    T: 'a,
+    R: Deref<Target = [T; N]>,
+{
+    type Entry = T;
+    type SliceRef = &'a [T; N];
+
+    fn as_sized_slice(&'a self) -> Self::SliceRef {
+        self
+    }
 }
 
 /// Can be converted to a mutable slice
-pub trait AsMutSlice {
-    /// Type of the entries in this mut slice
-    type Entry;
+pub trait AsSliceMut<'a>: AsSlice<'a> {
+    /// Type of the mutable reference to this slice
+    type SliceRefMut: DerefMut<Target = [Self::Entry]>;
+
     /// Convert to a slice
-    fn as_mut_slice(&mut self) -> &mut [Self::Entry];
+    fn as_slice_mut(&'a mut self) -> Self::SliceRefMut;
 }
 
-#[cfg(feature = "alloc")]
-impl<T> AsSlice for Vec<T> {
-    type Entry = T;
+/// Can be converted to a mutable slice
+pub trait AsSizedSliceMut<'a, const N: usize>: AsSizedSlice<'a, N> {
+    /// Type of the mutable reference to this slice
+    type SliceRefMut: DerefMut<Target = [Self::Entry; N]>;
 
-    fn as_slice(&self) -> &[Self::Entry] {
-        self
+    /// Convert to a slice
+    fn as_sized_slice_mut(&'a mut self) -> Self::SliceRefMut;
+}
+
+impl<'a, T, R: ?Sized> AsSliceMut<'a> for R
+where
+    T: 'a,
+    R: DerefMut<Target = [T]>,
+{
+    type SliceRefMut = &'a mut [T];
+
+    fn as_slice_mut(&'a mut self) -> Self::SliceRefMut {
+        &mut *self
     }
 }
 
-#[cfg(feature = "alloc")]
-impl<T> AsMutSlice for Vec<T> {
-    type Entry = T;
+impl<'a, T, const N: usize, R: ?Sized> AsSizedSliceMut<'a, N> for R
+where
+    T: 'a,
+    R: DerefMut<Target = [T; N]>,
+{
+    type SliceRefMut = &'a mut [T; N];
 
-    fn as_mut_slice(&mut self) -> &mut [Self::Entry] {
-        self
-    }
-}
-
-impl<T> AsSlice for &[T] {
-    type Entry = T;
-
-    fn as_slice(&self) -> &[Self::Entry] {
-        self
-    }
-}
-
-impl<T> AsSlice for [T] {
-    type Entry = T;
-
-    fn as_slice(&self) -> &[Self::Entry] {
-        self
-    }
-}
-
-impl<T> AsMutSlice for &mut [T] {
-    type Entry = T;
-
-    fn as_mut_slice(&mut self) -> &mut [Self::Entry] {
-        self
-    }
-}
-
-impl<T> AsMutSlice for [T] {
-    type Entry = T;
-
-    fn as_mut_slice(&mut self) -> &mut [Self::Entry] {
-        self
+    fn as_sized_slice_mut(&'a mut self) -> Self::SliceRefMut {
+        &mut *self
     }
 }
 
@@ -708,22 +796,51 @@ impl<T> AsMutSlice for [T] {
 pub trait AsIter<'it> {
     /// The item type
     type Item: 'it;
+    /// The ref type
+    type Ref: Deref<Target = Self::Item>;
     /// The iterator type
-    type IntoIter: Iterator<Item = &'it Self::Item>;
+    type IntoIter: Iterator<Item = Self::Ref>;
 
     /// Create an iterator from &self
     fn as_iter(&'it self) -> Self::IntoIter;
 }
 
+impl<'it, S, T> AsIter<'it> for S
+where
+    S: AsSlice<'it, Entry = T, SliceRef = &'it [T]>,
+    T: 'it,
+{
+    type Item = S::Entry;
+    type Ref = &'it Self::Item;
+    type IntoIter = core::slice::Iter<'it, Self::Item>;
+
+    fn as_iter(&'it self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 /// Create an `Iterator` from a mutable reference
-pub trait AsIterMut<'it> {
-    /// The item type
-    type Item: 'it;
+pub trait AsIterMut<'it>: AsIter<'it> {
+    /// The ref type
+    type RefMut: DerefMut<Target = Self::Item>;
     /// The iterator type
-    type IntoIter: Iterator<Item = &'it mut Self::Item>;
+    type IntoIterMut: Iterator<Item = Self::RefMut>;
 
     /// Create an iterator from &mut self
-    fn as_iter_mut(&'it mut self) -> Self::IntoIter;
+    fn as_iter_mut(&'it mut self) -> Self::IntoIterMut;
+}
+
+impl<'it, S, T> AsIterMut<'it> for S
+where
+    S: AsSliceMut<'it, Entry = T, SliceRef = &'it [T], SliceRefMut = &'it mut [T]>,
+    T: 'it,
+{
+    type RefMut = &'it mut Self::Item;
+    type IntoIterMut = core::slice::IterMut<'it, Self::Item>;
+
+    fn as_iter_mut(&'it mut self) -> Self::IntoIterMut {
+        self.as_slice_mut().iter_mut()
+    }
 }
 
 /// Has a length field
@@ -734,6 +851,20 @@ pub trait HasLen {
     /// Returns `true` if it has no elements.
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T> HasLen for Vec<T> {
+    #[inline]
+    fn len(&self) -> usize {
+        Vec::<T>::len(self)
+    }
+}
+
+impl<T: HasLen> HasLen for &mut T {
+    fn len(&self) -> usize {
+        self.deref().len()
     }
 }
 
@@ -840,19 +971,139 @@ impl SimpleStdoutLogger {
 }
 
 #[cfg(feature = "std")]
+#[cfg(target_os = "windows")]
+#[allow(clippy::cast_ptr_alignment)]
+#[must_use]
+/// Return thread ID without using TLS
+pub fn get_thread_id() -> u64 {
+    use std::arch::asm;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let teb: *const u8;
+        asm!("mov {}, gs:[0x30]", out(reg) teb);
+        let thread_id_ptr = teb.add(0x48) as *const u32;
+        u64::from(*thread_id_ptr)
+    }
+
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        let teb: *const u8;
+        asm!("mov {}, fs:[0x18]", out(reg) teb);
+        let thread_id_ptr = teb.add(0x24) as *const u32;
+        *thread_id_ptr as u64
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[must_use]
+#[allow(clippy::cast_sign_loss)]
+/// Return thread ID without using TLS
+pub fn get_thread_id() -> u64 {
+    use libc::{syscall, SYS_gettid};
+
+    unsafe { syscall(SYS_gettid) as u64 }
+}
+
+#[cfg(feature = "std")]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[must_use]
+/// Return thread ID using Rust's `std::thread`
+pub fn get_thread_id() -> u64 {
+    // Fallback for other platforms
+    let thread_id = std::thread::current().id();
+    unsafe { mem::transmute::<_, u64>(thread_id) }
+}
+
+#[cfg(feature = "std")]
+#[cfg(target_os = "windows")]
+mod windows_logging {
+    use std::ptr;
+
+    use once_cell::sync::OnceCell;
+    use winapi::um::{
+        fileapi::WriteFile, handleapi::INVALID_HANDLE_VALUE, processenv::GetStdHandle,
+        winbase::STD_OUTPUT_HANDLE, winnt::HANDLE,
+    };
+
+    // Safe wrapper around HANDLE
+    struct StdOutHandle(HANDLE);
+
+    // Implement Send and Sync for StdOutHandle, assuming it's safe to share
+    unsafe impl Send for StdOutHandle {}
+    unsafe impl Sync for StdOutHandle {}
+
+    static H_STDOUT: OnceCell<StdOutHandle> = OnceCell::new();
+
+    fn get_stdout_handle() -> HANDLE {
+        H_STDOUT
+            .get_or_init(|| {
+                let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+                StdOutHandle(handle)
+            })
+            .0
+    }
+    /// A function that writes directly to stdout using `WinAPI`.
+    /// Works much faster than println and does not need TLS
+    pub fn direct_log(message: &str) {
+        // Get the handle to standard output
+        let h_stdout: HANDLE = get_stdout_handle();
+
+        if h_stdout == INVALID_HANDLE_VALUE {
+            eprintln!("Failed to get standard output handle");
+            return;
+        }
+
+        let bytes = message.as_bytes();
+        let mut bytes_written = 0;
+
+        // Write the message to standard output
+        let result = unsafe {
+            WriteFile(
+                h_stdout,
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+                &mut bytes_written,
+                ptr::null_mut(),
+            )
+        };
+
+        if result == 0 {
+            eprintln!("Failed to write to standard output");
+        }
+    }
+}
+
+#[cfg(feature = "std")]
 impl log::Log for SimpleStdoutLogger {
     #[inline]
     fn enabled(&self, _metadata: &Metadata) -> bool {
         true
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn log(&self, record: &Record) {
         println!(
-            "[{:?}] {}: {}",
+            "[{:?}, {:?}:{:?}] {}: {}",
             current_time(),
+            std::process::id(),
+            get_thread_id(),
             record.level(),
             record.args()
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn log(&self, record: &Record) {
+        // println is not safe in TLS-less environment
+        let msg = format!(
+            "[{:?}, {:?}:{:?}] {}: {}\n",
+            current_time(),
+            std::process::id(),
+            get_thread_id(),
+            record.level(),
+            record.args()
+        );
+        windows_logging::direct_log(msg.as_str());
     }
 
     fn flush(&self) {}
@@ -894,8 +1145,9 @@ impl log::Log for SimpleStderrLogger {
 
     fn log(&self, record: &Record) {
         eprintln!(
-            "[{:?}] {}: {}",
+            "[{:?}, {:?}] {}: {}",
             current_time(),
+            std::process::id(),
             record.level(),
             record.args()
         );
@@ -939,9 +1191,11 @@ impl SimpleFdLogger {
         // # Safety
         // The passed-in `fd` has to be a legal file descriptor to log to.
         // We also access a shared variable here.
+        let logger = &raw mut LIBAFL_RAWFD_LOGGER;
         unsafe {
-            LIBAFL_RAWFD_LOGGER.set_fd(log_fd);
-            log::set_logger(&*ptr::addr_of!(LIBAFL_RAWFD_LOGGER))?;
+            let logger = &mut *logger;
+            logger.set_fd(log_fd);
+            log::set_logger(logger)?;
         }
         Ok(())
     }
@@ -958,8 +1212,9 @@ impl log::Log for SimpleFdLogger {
         let mut f = unsafe { File::from_raw_fd(self.fd) };
         writeln!(
             f,
-            "[{:?}] {}: {}",
+            "[{:?}, {:#?}] {}: {}",
             current_time(),
+            std::process::id(),
             record.level(),
             record.args()
         )
@@ -976,6 +1231,7 @@ impl log::Log for SimpleFdLogger {
 /// # Safety
 /// The function is arguably safe, but it might have undesirable side effects since it closes `stdout` and `stderr`.
 #[cfg(all(unix, feature = "std"))]
+#[expect(unused_qualifications)]
 pub unsafe fn dup_and_mute_outputs() -> Result<(RawFd, RawFd), Error> {
     let old_stdout = stdout().as_raw_fd();
     let old_stderr = stderr().as_raw_fd();
@@ -1002,15 +1258,101 @@ pub unsafe fn set_error_print_panic_hook(new_stderr: RawFd) {
         let mut f = unsafe { File::from_raw_fd(new_stderr) };
         writeln!(f, "{panic_info}",)
             .unwrap_or_else(|err| println!("Failed to log to fd {new_stderr}: {err}"));
-        std::mem::forget(f);
+        mem::forget(f);
     }));
 }
 
+#[cfg(feature = "std")]
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[allow(clippy::upper_case_acronyms)]
+struct TEB {
+    reserved1: [u8; 0x58],
+    tls_pointer: *mut *mut u8,
+    reserved2: [u8; 0xC0],
+}
+
+#[cfg(feature = "std")]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[cfg(target_os = "windows")]
+fn nt_current_teb() -> *mut TEB {
+    use std::arch::asm;
+    let teb: *mut TEB;
+    unsafe {
+        asm!("mov {}, gs:0x30", out(reg) teb);
+    }
+    teb
+}
+
+/// Some of our hooks can be invoked from threads that do not have TLS yet.
+/// Many Rust and Frida functions require TLS to be set up, so we need to check if we have TLS.
+/// This was observed on Windows, so for now for other platforms we assume that we have TLS.
+#[cfg(feature = "std")]
+#[inline]
+#[allow(unreachable_code)]
+#[must_use]
+pub fn has_tls() -> bool {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let teb = nt_current_teb();
+        if teb.is_null() {
+            return false;
+        }
+
+        let tls_array = (*teb).tls_pointer;
+        if tls_array.is_null() {
+            return false;
+        }
+        return true;
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let mut tid: u64;
+        std::arch::asm!(
+            "mrs {tid}, TPIDRRO_EL0",
+            tid = out(reg) tid,
+        );
+        tid &= 0xffff_ffff_ffff_fff8;
+        let tlsptr = tid as *const u64;
+        return tlsptr.add(0x102).read() != 0u64;
+    }
+    // Default
+    true
+}
+
+/// Zero-cost way to construct [`core::num::NonZeroUsize`] at compile-time.
+#[macro_export]
+macro_rules! nonzero {
+    // TODO: Further simplify with `unwrap`/`expect` once MSRV includes
+    // https://github.com/rust-lang/rust/issues/67441
+    ($val:expr) => {
+        const {
+            match core::num::NonZero::new($val) {
+                Some(x) => x,
+                None => panic!("Value passed to `nonzero!` was zero"),
+            }
+        }
+    };
+}
+
+/// Get a [`core::ptr::NonNull`] to a global static mut (or similar).
+///
+/// The same as [`core::ptr::addr_of_mut`] or `&raw mut`, but wrapped in said [`NonNull`](core::ptr::NonNull).
+#[macro_export]
+macro_rules! nonnull_raw_mut {
+    ($val:expr) => {
+        // # Safety
+        // The pointer to a value will never be null (unless we're on an archaic OS in a CTF challenge).
+        unsafe { core::ptr::NonNull::new(&raw mut $val).unwrap_unchecked() }
+    };
+}
+
 #[cfg(feature = "python")]
-#[allow(missing_docs)]
+#[allow(missing_docs)] // expect somehow breaks here
 pub mod pybind {
 
-    use pyo3::{pymodule, types::PyModule, PyResult, Python};
+    use pyo3::{pymodule, types::PyModule, Bound, PyResult};
 
     #[macro_export]
     macro_rules! unwrap_me_body {
@@ -1142,17 +1484,35 @@ pub mod pybind {
     #[pymodule]
     #[pyo3(name = "libafl_bolts")]
     /// Register the classes to the python module
-    pub fn python_module(py: Python, m: &PyModule) -> PyResult<()> {
-        crate::rands::pybind::register(py, m)?;
+    pub fn python_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        crate::rands::pybind::register(m)?;
         Ok(())
     }
 }
 
+/// Create a [`Vec`] of the given type with `nb_elts` elements, initialized in place.
+/// The closure must initialize [`Vec`] (of size `nb_elts` * `sizeo_of::<T>()`).
+///
+/// # Safety
+///
+/// The input closure should fully initialize the new [`Vec`], not leaving any uninitialized bytes.
+// TODO: Use MaybeUninit API at some point.
+#[cfg(feature = "alloc")]
+#[expect(clippy::uninit_vec)]
+pub unsafe fn vec_init<E, F, T>(nb_elts: usize, init_fn: F) -> Result<Vec<T>, E>
+where
+    F: FnOnce(&mut Vec<T>) -> Result<(), E>,
+{
+    let mut new_vec: Vec<T> = Vec::with_capacity(nb_elts);
+    new_vec.set_len(nb_elts);
+
+    init_fn(&mut new_vec)?;
+
+    Ok(new_vec)
+}
+
 #[cfg(test)]
 mod tests {
-
-    #[cfg(all(feature = "std", unix))]
-    use core::ptr;
 
     #[cfg(all(feature = "std", unix))]
     use crate::LIBAFL_RAWFD_LOGGER;
@@ -1163,8 +1523,10 @@ mod tests {
         use std::{io::stdout, os::fd::AsRawFd};
 
         unsafe { LIBAFL_RAWFD_LOGGER.fd = stdout().as_raw_fd() };
+
+        let libafl_rawfd_logger_fd = &raw const LIBAFL_RAWFD_LOGGER;
         unsafe {
-            log::set_logger(&*ptr::addr_of!(LIBAFL_RAWFD_LOGGER)).unwrap();
+            log::set_logger(&*libafl_rawfd_logger_fd).unwrap();
         }
         log::set_max_level(log::LevelFilter::Debug);
         log::info!("Test");

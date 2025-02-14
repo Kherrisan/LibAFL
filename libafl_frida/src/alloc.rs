@@ -1,4 +1,5 @@
 #[cfg(any(
+    windows,
     target_os = "linux",
     target_vendor = "apple",
     all(
@@ -10,9 +11,19 @@ use std::{collections::BTreeMap, ffi::c_void};
 
 use backtrace::Backtrace;
 use frida_gum::{PageProtection, RangeDetails};
-use hashbrown::HashMap;
 use libafl_bolts::cli::FuzzerOptions;
+#[cfg(target_vendor = "apple")]
+use mach_sys::{
+    kern_return::KERN_SUCCESS,
+    message::mach_msg_type_number_t,
+    traps::mach_task_self,
+    vm::mach_vm_region_recurse,
+    vm_prot::VM_PROT_READ,
+    vm_region::{vm_region_recurse_info_t, vm_region_submap_info_64},
+    vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t},
+};
 #[cfg(any(
+    windows,
     target_os = "linux",
     target_vendor = "apple",
     all(
@@ -20,12 +31,14 @@ use libafl_bolts::cli::FuzzerOptions;
         target_os = "android"
     )
 ))]
-use mmap_rs::{MemoryAreas, MmapFlags, MmapMut, MmapOptions, ReservedMut};
-use nix::libc::memset;
+use mmap_rs::{MmapFlags, MmapMut, MmapOptions, ReservedMut};
 use rangemap::RangeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::asan::errors::{AsanError, AsanErrors};
+
+#[cfg(target_vendor = "apple")]
+const VM_REGION_SUBMAP_INFO_COUNT_64: mach_msg_type_number_t = 19;
 
 /// An allocator wrapper with binary-only address sanitization
 #[derive(Debug)]
@@ -41,11 +54,13 @@ pub struct Allocator {
     /// The shadow bit
     shadow_bit: usize,
     /// The reserved (pre-allocated) shadow mapping
-    pre_allocated_shadow_mappings: HashMap<(usize, usize), ReservedMut>,
+    pre_allocated_shadow_mappings: Vec<ReservedMut>,
+    /// Whether we've pre allocated a shadow mapping:
+    using_pre_allocated_shadow_mapping: bool,
     /// All tracked allocations
-    allocations: HashMap<usize, AllocationMetadata>,
+    allocations: BTreeMap<usize, AllocationMetadata>,
     /// All mappings
-    mappings: HashMap<usize, MmapMut>,
+    mappings: BTreeMap<usize, MmapMut>,
     /// The shadow memory pages
     shadow_pages: RangeSet<usize>,
     /// A list of allocations
@@ -153,18 +168,17 @@ impl Allocator {
 
     /// Allocate a new allocation of the given size.
     #[must_use]
-    #[allow(clippy::missing_safety_doc)]
+    #[expect(clippy::missing_safety_doc)]
     pub unsafe fn alloc(&mut self, size: usize, _alignment: usize) -> *mut c_void {
         let mut is_malloc_zero = false;
         let size = if size == 0 {
-            // log::warn!("zero-sized allocation!");
             is_malloc_zero = true;
             16
         } else {
             size
         };
         if size > self.max_allocation {
-            #[allow(clippy::manual_assert)]
+            #[expect(clippy::manual_assert)]
             if self.max_allocation_panics {
                 panic!("ASAN: Allocation is too large: 0x{size:x}");
             }
@@ -179,7 +193,6 @@ impl Allocator {
         self.total_allocation_size += rounded_up_size;
 
         let metadata = if let Some(mut metadata) = self.find_smallest_fit(rounded_up_size) {
-            //log::trace!("reusing allocation at {:x}, (actual mapping starts at {:x}) size {:x}", metadata.address, metadata.address - self.page_size, size);
             metadata.is_malloc_zero = is_malloc_zero;
             metadata.size = size;
             if self.allocation_backtraces {
@@ -187,7 +200,10 @@ impl Allocator {
             }
             metadata
         } else {
-            // log::trace!("{:x}, {:x}", self.current_mapping_addr, rounded_up_size);
+            // log::info!(
+            //     "Mapping {:x}, size {rounded_up_size:x}",
+            //     self.current_mapping_addr
+            // );
             let mapping = match MmapOptions::new(rounded_up_size)
                 .unwrap()
                 .with_address(self.current_mapping_addr)
@@ -234,28 +250,32 @@ impl Allocator {
         let address = (metadata.address + self.page_size) as *mut c_void;
 
         self.allocations.insert(address as usize, metadata);
-        // log::trace!("serving address: {:?}, size: {:x}", address, size);
+        // log::info!("serving address: {address:?}, size: {size:x}");
         address
     }
 
     /// Releases the allocation at the given address.
-    #[allow(clippy::missing_safety_doc)]
+    #[expect(clippy::missing_safety_doc)]
     pub unsafe fn release(&mut self, ptr: *mut c_void) {
-        //log::trace!("freeing address: {:?}", ptr);
+        // log::info!("releasing {:?}", ptr);
         let Some(metadata) = self.allocations.get_mut(&(ptr as usize)) else {
-            if !ptr.is_null() {
-                AsanErrors::get_mut()
-                    .report_error(AsanError::UnallocatedFree((ptr as usize, Backtrace::new())));
+            if !ptr.is_null()
+                && AsanErrors::get_mut_blocking()
+                    .report_error(AsanError::UnallocatedFree((ptr as usize, Backtrace::new())))
+            {
+                panic!("ASAN: Crashing target!");
             }
             return;
         };
 
-        if metadata.freed {
-            AsanErrors::get_mut().report_error(AsanError::DoubleFree((
+        if metadata.freed
+            && AsanErrors::get_mut_blocking().report_error(AsanError::DoubleFree((
                 ptr as usize,
                 metadata.clone(),
                 Backtrace::new(),
-            )));
+            )))
+        {
+            panic!("ASAN: Crashing target!");
         }
         let shadow_mapping_start = map_to_shadow!(self, ptr as usize);
 
@@ -276,7 +296,7 @@ impl Allocator {
     ) -> Option<&mut AllocationMetadata> {
         let mut metadatas: Vec<&mut AllocationMetadata> = self.allocations.values_mut().collect();
         metadatas.sort_by(|a, b| a.address.cmp(&b.address));
-        let mut offset_to_closest = i64::max_value();
+        let mut offset_to_closest = i64::MAX;
         let mut closest = None;
         let ptr: i64 = ptr.try_into().unwrap();
         for metadata in metadatas {
@@ -297,13 +317,15 @@ impl Allocator {
     /// Resets the allocator contents
     pub fn reset(&mut self) {
         let mut tmp_allocations = Vec::new();
-        for (address, mut allocation) in self.allocations.drain() {
+        while let Some((address, mut allocation)) = self.allocations.pop_first() {
             if !allocation.freed {
                 tmp_allocations.push(allocation);
                 continue;
             }
             // First poison the memory.
-            Self::poison(map_to_shadow!(self, address), allocation.size);
+            unsafe {
+                Self::poison(map_to_shadow!(self, address), allocation.size);
+            }
 
             // Reset the allocaiton metadata object
             allocation.size = 0;
@@ -338,35 +360,38 @@ impl Allocator {
         }
     }
 
-    fn unpoison(start: usize, size: usize) {
-        // log::trace!("unpoisoning {:x} for {:x}", start, size / 8 + 1);
+    /// Unpoison an area in memory
+    ///
+    /// # Safety
+    /// start needs to be a valid address, We need to be able to fill `size / 8` bytes.
+    unsafe fn unpoison(start: usize, size: usize) {
         unsafe {
-            // log::trace!("memset: {:?}", start as *mut c_void);
-            memset(start as *mut c_void, 0xff, size / 8);
+            std::slice::from_raw_parts_mut(start as *mut u8, size / 8).fill(0xff);
 
             let remainder = size % 8;
             if remainder > 0 {
-                // log::trace!("remainder: {:x}, offset: {:x}", remainder, start + size / 8);
-                memset(
-                    (start + size / 8) as *mut c_void,
-                    (0xff << (8 - remainder)) & 0xff,
-                    1,
-                );
+                let mut current_value = ((start + size / 8) as *const u8).read();
+                current_value |= 0xff << (8 - remainder);
+                ((start + size / 8) as *mut u8).write(current_value);
             }
         }
     }
 
-    /// Poisonn an area in memory
-    pub fn poison(start: usize, size: usize) {
-        // log::trace!("poisoning {:x} for {:x}", start, size / 8 + 1);
+    /// Poison an area in memory
+    ///
+    /// # Safety
+    /// start needs to be a valid address, We need to be able to fill `size / 8` bytes.
+    pub unsafe fn poison(start: usize, size: usize) {
         unsafe {
-            // log::trace!("memset: {:?}", start as *mut c_void);
-            memset(start as *mut c_void, 0x00, size / 8);
+            std::slice::from_raw_parts_mut(start as *mut u8, size / 8).fill(0x0);
 
             let remainder = size % 8;
             if remainder > 0 {
-                // log::trace!("remainder: {:x}, offset: {:x}", remainder, start + size / 8);
-                memset((start + size / 8) as *mut c_void, 0x00, 1);
+                let mask = !(0xff << (8 - remainder));
+                let mut current_value = ((start + size / 8) as *const u8).read();
+
+                current_value &= mask;
+                ((start + size / 8) as *mut u8).write(current_value);
             }
         }
     }
@@ -379,89 +404,165 @@ impl Allocator {
         unpoison: bool,
     ) -> (usize, usize) {
         let shadow_mapping_start = map_to_shadow!(self, start);
-
+        // log::trace!("map_shadow_for_region: {:x}, {:x}", start, end);
         let shadow_start = self.round_down_to_page(shadow_mapping_start);
-        // I'm not sure this works as planned. The same address appearing as start and end is mapped to
-        // different addresses.
-        let shadow_end = self.round_up_to_page((end - start) / 8) + self.page_size + shadow_start;
-        log::trace!(
-            "map_shadow_for_region start: {:x}, end {:x}, size {:x}, shadow {:x}-{:x}",
-            start,
-            end,
-            end - start,
-            shadow_start,
-            shadow_end
-        );
-        if self.pre_allocated_shadow_mappings.is_empty() {
-            for range in self.shadow_pages.gaps(&(shadow_start..shadow_end)) {
-                /*
-                log::trace!(
-                    "range: {:x}-{:x}, pagesize: {}",
-                    range.start, range.end, self.page_size
-                );
-                */
-                let mapping = MmapOptions::new(range.end - range.start - 1)
-                    .unwrap()
-                    .with_address(range.start)
-                    .map_mut()
-                    .expect("An error occurred while mapping shadow memory");
-
-                self.mappings.insert(range.start, mapping);
-            }
-
-            log::trace!("adding shadow pages {:x} - {:x}", shadow_start, shadow_end);
-            self.shadow_pages.insert(shadow_start..shadow_end);
-        } else {
-            let mut new_shadow_mappings = Vec::new();
+        let shadow_end = self.round_up_to_page((end - start) / 8 + self.page_size + shadow_start);
+        // log::trace!(
+        //     "map_shadow_for_region: shadow_start {:x}, shadow_end {:x}",
+        //     shadow_start,
+        //     shadow_end
+        // );
+        if self.using_pre_allocated_shadow_mapping {
+            let mut newly_committed_regions = Vec::new();
             for gap in self.shadow_pages.gaps(&(shadow_start..shadow_end)) {
-                for ((pa_start, pa_end), shadow_mapping) in &mut self.pre_allocated_shadow_mappings
-                {
-                    if *pa_start <= gap.start && gap.start < *pa_start + shadow_mapping.len() {
-                        log::trace!("pa_start: {:x}, pa_end {:x}, gap.start {:x}, shadow_mapping.ptr {:x}, shadow_mapping.len {:x}",
-                         *pa_start, *pa_end, gap.start, shadow_mapping.as_ptr() as usize, shadow_mapping.len());
+                let mut new_reserved_region = None;
+                for reserved in &mut self.pre_allocated_shadow_mappings {
+                    if gap.start >= reserved.start() && gap.end <= reserved.end() {
+                        let mut to_be_commited =
+                            reserved.split_off(gap.start - reserved.start()).unwrap();
 
-                        // Split the preallocated mapping into two parts, keeping the
-                        // part before the gap and returning the part starting with the gap as a new mapping
-                        let mut start_mapping =
-                            shadow_mapping.split_off(gap.start - *pa_start).unwrap();
-
-                        // Split the new mapping into two parts,
-                        // keeping the part holding the gap and returning the part starting after the gap as a new mapping
-                        let end_mapping = start_mapping.split_off(gap.end - gap.start).unwrap();
-
-                        //Push the new after-the-gap mapping to the list of mappings to be added
-                        new_shadow_mappings.push(((gap.end, *pa_end), end_mapping));
-
-                        // Insert the new gap mapping into the list of mappings
-                        self.mappings
-                            .insert(gap.start, start_mapping.try_into().unwrap());
-
+                        if to_be_commited.end() > gap.end {
+                            let upper = to_be_commited
+                                .split_off(gap.end - to_be_commited.start())
+                                .unwrap();
+                            new_reserved_region = Some(upper);
+                        }
+                        let commited: MmapMut = to_be_commited
+                            .try_into()
+                            .expect("Failed to commit reserved shadow memory");
+                        newly_committed_regions.push(commited);
                         break;
                     }
                 }
-            }
-            for new_shadow_mapping in new_shadow_mappings {
-                log::trace!(
-                    "adding pre_allocated_shadow_mappings and shadow pages {:x} - {:x}",
-                    new_shadow_mapping.0 .0,
-                    new_shadow_mapping.0 .1
-                );
-                self.pre_allocated_shadow_mappings
-                    .insert(new_shadow_mapping.0, new_shadow_mapping.1);
 
+                if let Some(new_reserved_region) = new_reserved_region {
+                    self.pre_allocated_shadow_mappings.push(new_reserved_region);
+                }
+            }
+            for newly_committed_region in newly_committed_regions {
+                // log::trace!(
+                //     "committed shadow pages: start {:x}, end {:x}",
+                //     newly_committed_region.start(),
+                //     newly_committed_region.end()
+                // );
                 self.shadow_pages
-                    .insert(new_shadow_mapping.0 .0..new_shadow_mapping.0 .1);
+                    .insert(newly_committed_region.start()..newly_committed_region.end());
+                self.mappings
+                    .insert(newly_committed_region.start(), newly_committed_region);
             }
         }
 
-        // log::trace!("shadow_mapping_start: {:x}, shadow_size: {:x}", shadow_mapping_start, (end - start) / 8);
         if unpoison {
-            Self::unpoison(shadow_mapping_start, end - start);
+            unsafe {
+                Self::unpoison(shadow_mapping_start, end - start);
+            }
         }
 
-        (shadow_mapping_start, (end - start) / 8)
+        (shadow_mapping_start, (end - start) / 8 + 1)
     }
 
+    #[inline]
+    #[must_use]
+    fn check_shadow_aligned(&mut self, address: *const c_void, size: usize) -> bool {
+        assert_eq!(
+            (address as usize) & 7,
+            0,
+            "check_shadow_aligned used when address is not aligned. Use check_shadow"
+        );
+        assert_eq!(
+            size & 7,
+            0,
+            "check_shadow_aligned used when size is not aligned. Use check_shadow"
+        );
+
+        if size == 0 {
+            return true;
+        }
+
+        let shadow_addr = map_to_shadow!(self, (address as usize));
+        let shadow_size = size >> 3;
+        let buf = unsafe { std::slice::from_raw_parts_mut(shadow_addr as *mut u8, shadow_size) };
+        let (prefix, aligned, suffix) = unsafe { buf.align_to::<u128>() };
+        if !prefix.iter().all(|&x| x == 0xff)
+            || !suffix.iter().all(|&x| x == 0xff)
+            || !aligned
+                .iter()
+                .all(|&x| x == 0xffffffffffffffffffffffffffffffffu128)
+        {
+            return false;
+        }
+
+        true
+    }
+    /// Checks whether the given address up till size is valid unpoisoned shadow memory.
+    /// TODO: check edge cases
+    #[inline]
+    #[must_use]
+    pub fn check_shadow(&mut self, address: *const c_void, size: usize) -> bool {
+        //the algorithm for check_shadow is as follows:
+        //1. we first check if its managed. if is not then exit
+        //2. we check if it is aligned. this should be 99% of accesses. If it is do an aligned check and leave
+        //3. if it is not split the check into 3 parts: the pre-aligment bytes, the aligned portion, and the post alignment posts
+        //3. The prealignment bytes are the unaligned bytes (if any) located in the qword preceding the aligned portion. Perform a specialied check to ensure that the bytes from [start, align(start, 8)) are valid. In this case align(start,8) aligns start to the next 8 byte boundary.
+        //4. The aligned check is where the address and the size is 8 byte aligned. Use check_shadow_aligned to check it
+        //5. The post-alignment is the same as pre-alignment except it is the qword following the aligned portion. Use a specialized check to ensure that [end & ~7, end) is valid.
+
+        if size == 0 {
+            return true;
+        }
+
+        if !self.is_managed(address.cast_mut()) {
+            return true;
+        }
+
+        //fast path. most buffers are likely 8 byte aligned in size and address
+        if (address as usize).trailing_zeros() >= 3 && size.trailing_zeros() >= 3 {
+            return self.check_shadow_aligned(address, size);
+        }
+
+        //slow path. check everything
+        let start_address = address as usize;
+        let end_address = start_address + size;
+
+        //8 byte align the start/end so we can use check_shadow_aligned for the majority of it
+        //in the case of subqword accesses (i.e,, the entire access is located within 1 qword), aligned_start > aligned_end naturally
+        let aligned_start = (start_address + 7) & !7;
+        let aligned_end = end_address & !7;
+
+        let start_offset = start_address & 7;
+        let end_offset = end_address & 7;
+
+        //if the start is unaligned
+        if start_address != aligned_start {
+            let start_shadow = map_to_shadow!(self, start_address);
+
+            let start_mask: u8 = 0xff << (8 - start_offset);
+            if unsafe { (start_shadow as *const u8).read() } & start_mask != start_mask {
+                return false;
+            }
+        }
+
+        //if this is not true then it must be a subqword access as the start will be larger than the end
+        if aligned_start <= aligned_end {
+            if !self
+                .check_shadow_aligned(aligned_start as *const c_void, aligned_end - aligned_start)
+            {
+                return false;
+            }
+
+            if end_address != aligned_end {
+                let end_shadow = map_to_shadow!(self, end_address);
+
+                let end_mask = 0xff << (8 - end_offset); //we want to check from the beginning of the qword to the offset
+                if unsafe { (end_shadow as *const u8).read() } & end_mask != end_mask {
+                    return false;
+                }
+            }
+        }
+        // self.map_shadow_for_region(address, address + size, false);
+
+        true
+    }
     /// Maps the address to a shadow address
     #[inline]
     #[must_use]
@@ -469,6 +570,20 @@ impl Allocator {
         map_to_shadow!(self, start)
     }
 
+    /// Is this a valid and mapped shadow address?
+    #[must_use]
+    pub fn valid_shadow(&self, start: usize, size: usize) -> bool {
+        let range_to_check = start..(start + size);
+        let valid = self
+            .shadow_pages
+            .overlapping(&range_to_check)
+            .any(|r| r.start <= start && r.end >= start + size);
+
+        if !valid {
+            log::error!("Not a valid shadow: {:#x}!", start);
+        }
+        valid
+    }
     /// Checks if the currennt address is one of ours
     #[inline]
     pub fn is_managed(&self, ptr: *mut c_void) -> bool {
@@ -479,26 +594,95 @@ impl Allocator {
     /// Checks if any of the allocations has not been freed
     pub fn check_for_leaks(&self) {
         for metadata in self.allocations.values() {
-            if !metadata.freed {
-                AsanErrors::get_mut()
-                    .report_error(AsanError::Leak((metadata.address, metadata.clone())));
+            if !metadata.freed
+                && AsanErrors::get_mut_blocking()
+                    .report_error(AsanError::Leak((metadata.address, metadata.clone())))
+            {
+                unsafe {
+                    println!(
+                        "{:x?}",
+                        std::slice::from_raw_parts(metadata.address as *const u8, metadata.size)
+                    );
+                };
+                panic!("ASAN: Crashing target!");
             }
         }
     }
 
-    /// Unpoison all the memory that is currently mapped with read/write permissions.
+    /// Unpoison all the memory that is currently mapped with read permissions.
+    #[cfg(target_vendor = "apple")]
     pub fn unpoison_all_existing_memory(&mut self) {
-        RangeDetails::enumerate_with_prot(PageProtection::NoAccess, &mut |range: &RangeDetails| {
-            if range.protection() as u32 & PageProtection::ReadWrite as u32 != 0 {
+        let task = unsafe { mach_task_self() };
+        let mut address: mach_vm_address_t = 0;
+        let mut size: mach_vm_size_t = 0;
+        let mut depth: natural_t = 0;
+
+        loop {
+            let mut kr;
+            let mut info_count: mach_msg_type_number_t = VM_REGION_SUBMAP_INFO_COUNT_64;
+            let mut info = vm_region_submap_info_64::default();
+            loop {
+                kr = unsafe {
+                    mach_vm_region_recurse(
+                        task,
+                        &raw mut address,
+                        &raw mut size,
+                        &raw mut depth,
+                        &raw mut info as vm_region_recurse_info_t,
+                        &raw mut info_count,
+                    )
+                };
+
+                if kr != KERN_SUCCESS {
+                    break;
+                }
+
+                if info.is_submap != 0 {
+                    depth += 1;
+                    continue;
+                }
+
+                break;
+            }
+
+            if kr != KERN_SUCCESS {
+                break;
+            }
+
+            let start = address as usize;
+            let end = (address + size) as usize;
+
+            if info.protection & VM_PROT_READ == VM_PROT_READ {
+                //if its at least readable
+                if self.shadow_offset <= start && end <= self.current_mapping_addr {
+                    log::trace!("Reached the shadow/allocator region - skipping");
+                } else {
+                    log::trace!("Unpoisoning: {:#x}:{:#x}", address, address + size);
+                    self.map_shadow_for_region(start, end, true);
+                }
+            }
+            address += size;
+            size = 0;
+        }
+    }
+
+    /// Unpoisons all memory
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn unpoison_all_existing_memory(&mut self) {
+        RangeDetails::enumerate_with_prot(
+            PageProtection::Read,
+            &mut |range: &RangeDetails| -> bool {
                 let start = range.memory_range().base_address().0 as usize;
                 let end = start + range.memory_range().size();
-                if !self.pre_allocated_shadow_mappings.is_empty() && start == 1 << self.shadow_bit {
-                    return true;
+                if self.shadow_offset <= start && end <= self.current_mapping_addr {
+                    log::trace!("Reached the shadow/allocator region - skipping");
+                } else {
+                    // log::trace!("Unpoisoning: {:#x}-{:#x}", start, end);
+                    self.map_shadow_for_region(start, end, true);
                 }
-                self.map_shadow_for_region(start, end, true);
-            }
-            true
-        });
+                true
+            },
+        );
     }
 
     /// Initialize the allocator, making sure a valid shadow bit is selected.
@@ -512,57 +696,71 @@ impl Allocator {
 
         let mut occupied_ranges: Vec<(usize, usize)> = vec![];
         // max(userspace address) this is usually 0x8_0000_0000_0000 - 1 on x64 linux.
+        #[cfg(unix)]
         let mut userspace_max: usize = 0;
 
         // Enumerate memory ranges that are already occupied.
-        for area in MemoryAreas::open(None).unwrap() {
-            let start = area.as_ref().unwrap().start();
-            let end = area.unwrap().end();
-            occupied_ranges.push((start, end));
-            // log::trace!("Occupied {:x} {:x}", start, end);
-            let base: usize = 2;
-            // On x64, if end > 2**48, then that's in vsyscall or something.
-            #[cfg(all(unix, target_arch = "x86_64"))]
-            if end <= base.pow(48) && end > userspace_max {
-                userspace_max = end;
-            }
 
-            #[cfg(all(not(unix), target_arch = "x86_64"))]
-            if (end >> 3) <= base.pow(44) && (end >> 3) > userspace_max {
-                userspace_max = end >> 3;
-            }
+        RangeDetails::enumerate_with_prot(
+            PageProtection::Read,
+            &mut |range: &RangeDetails| -> bool {
+                let start = range.memory_range().base_address().0 as usize;
+                let end = start + range.memory_range().size();
+                log::trace!("New range: {:#x}-{:#x}", start, end);
 
-            // On aarch64, if end > 2**52, then range is not in userspace
-            #[cfg(target_arch = "aarch64")]
-            if end <= base.pow(52) && end > userspace_max {
-                userspace_max = end;
-            }
-        }
+                #[cfg(target_vendor = "apple")]
+                if start >= 0x600000000000 {
+                    //this is the MALLOC_NANO region. There is no point in spending time tracking this region as we hook malloc
+                    return false;
+                }
 
-        let mut maxbit = 0;
-        for power in 1..64 {
-            let base: usize = 2;
-            if base.pow(power) > userspace_max {
+                occupied_ranges.push((start, end));
+                // On x64, if end > 2**48, then that's in vsyscall or something.
+                #[cfg(all(unix, target_arch = "x86_64"))]
+                if end <= 2_usize.pow(48) && end > userspace_max {
+                    userspace_max = end;
+                }
+                //
+                // #[cfg(all(not(unix), target_arch = "x86_64"))]
+                // if end <= 2_usize.pow(64) && end > userspace_max {
+                //     userspace_max = end;
+                // }
+
+                // On aarch64, if end > 2**52, then range is not in userspace
+                #[cfg(target_arch = "aarch64")]
+                if end <= 2_usize.pow(52) && end > userspace_max {
+                    userspace_max = end;
+                }
+
+                true
+            },
+        );
+
+        #[cfg(unix)]
+        let mut maxbit = 63;
+        #[cfg(windows)]
+        let maxbit = 63;
+        #[cfg(unix)]
+        for power in 44..64 {
+            if 2_usize.pow(power) > userspace_max {
                 maxbit = power;
                 break;
             }
         }
 
+        log::trace!("max bit: {}", maxbit);
+
         {
-            for try_shadow_bit in &[maxbit, maxbit - 4, maxbit - 3, maxbit - 2] {
+            for try_shadow_bit in 44..=maxbit {
                 let addr: usize = 1 << try_shadow_bit;
                 let shadow_start = addr;
                 let shadow_end = addr + addr + addr;
                 let mut good_candidate = true;
                 // check if the proposed shadow bit overlaps with occupied ranges.
                 for (start, end) in &occupied_ranges {
-                    // log::trace!("{:x} {:x}, {:x} {:x} -> {:x} - {:x}", shadow_start, shadow_end, start, end,
-                    //     shadow_start + ((start >> 3) & ((1 << (try_shadow_bit + 1)) - 1)),
-                    //     shadow_start + ((end >> 3) & ((1 << (try_shadow_bit + 1)) - 1))
-                    // );
                     if (shadow_start <= *end) && (*start <= shadow_end) {
                         log::trace!("{:x} {:x}, {:x} {:x}", shadow_start, shadow_end, start, end);
-                        log::warn!("shadow_bit {try_shadow_bit:x} is not suitable");
+                        log::warn!("shadow_bit {try_shadow_bit:} is not suitable");
                         good_candidate = false;
                         break;
                     }
@@ -573,7 +771,7 @@ impl Allocator {
                             > shadow_end)
                     {
                         log::warn!(
-                            "shadow_bit {try_shadow_bit:x} is not suitable (shadow out of range)"
+                            "shadow_bit {try_shadow_bit:} is not suitable (shadow out of range)"
                         );
                         good_candidate = false;
                         break;
@@ -582,33 +780,31 @@ impl Allocator {
 
                 if good_candidate {
                     // We reserve the shadow memory space of size addr*2, but don't commit it.
-                    if let Ok(mapping) = MmapOptions::new(1 << (*try_shadow_bit + 1))
+                    if let Ok(mapping) = MmapOptions::new(1 << (try_shadow_bit + 1))
                         .unwrap()
                         .with_flags(MmapFlags::NO_RESERVE)
                         .with_address(addr)
                         .reserve_mut()
                     {
-                        shadow_bit = (*try_shadow_bit).try_into().unwrap();
+                        shadow_bit = (try_shadow_bit).try_into().unwrap();
 
-                        log::warn!("shadow_bit {shadow_bit:x} is suitable");
+                        log::warn!("shadow_bit {shadow_bit:} is suitable");
                         log::trace!(
-                            "adding pre_allocated_shadow_mappings {:x} - {:x} with size {:}",
+                            "shadow area from {:x} to {:x} pre-allocated",
                             addr,
-                            (addr + (1 << (shadow_bit + 1))),
-                            mapping.len()
+                            addr + (1 << (try_shadow_bit + 1))
                         );
-
-                        self.pre_allocated_shadow_mappings
-                            .insert((addr, (addr + (1 << (shadow_bit + 1)))), mapping);
+                        self.pre_allocated_shadow_mappings.push(mapping);
+                        self.using_pre_allocated_shadow_mapping = true;
                         break;
                     }
-                    log::warn!("shadow_bit {try_shadow_bit:x} is not suitable - failed to allocate shadow memory");
+                    log::warn!("shadow_bit {try_shadow_bit:} is not suitable - failed to allocate shadow memory");
                 }
             }
         }
 
-        // assert!(shadow_bit != 0);
-        // attempt to pre-map the entire shadow-memory space
+        log::warn!("shadow_bit: {shadow_bit}");
+        assert!(shadow_bit != 0);
 
         let addr: usize = 1 << shadow_bit;
 
@@ -643,11 +839,12 @@ impl Default for Allocator {
             max_total_allocation: 1 << 32,
             allocation_backtraces: false,
             page_size,
-            pre_allocated_shadow_mappings: HashMap::new(),
-            mappings: HashMap::new(),
+            pre_allocated_shadow_mappings: Vec::new(),
+            using_pre_allocated_shadow_mapping: false,
+            mappings: BTreeMap::new(),
             shadow_offset: 0,
             shadow_bit: 0,
-            allocations: HashMap::new(),
+            allocations: BTreeMap::new(),
             shadow_pages: RangeSet::new(),
             allocation_queue: BTreeMap::new(),
             largest_allocation: 0,
@@ -656,4 +853,64 @@ impl Default for Allocator {
             current_mapping_addr: 0,
         }
     }
+}
+
+#[test]
+fn check_shadow() {
+    use frida_gum::Gum;
+    let _gum = Gum::obtain();
+    let mut allocator = Allocator::default();
+    allocator.init();
+
+    let allocation = unsafe { allocator.alloc(8, 8) };
+    assert!(!allocation.is_null());
+    assert!(allocator.check_shadow(allocation, 1));
+    assert!(allocator.check_shadow(allocation, 2));
+    assert!(allocator.check_shadow(allocation, 3));
+    assert!(allocator.check_shadow(allocation, 4));
+    assert!(allocator.check_shadow(allocation, 5));
+    assert!(allocator.check_shadow(allocation, 6));
+    assert!(allocator.check_shadow(allocation, 7));
+    assert!(allocator.check_shadow(allocation, 8));
+    assert!(!allocator.check_shadow(allocation, 9));
+    assert!(!allocator.check_shadow(allocation, 10));
+    assert!(allocator.check_shadow(unsafe { allocation.offset(1) }, 7));
+    assert!(allocator.check_shadow(unsafe { allocation.offset(2) }, 6));
+    assert!(allocator.check_shadow(unsafe { allocation.offset(3) }, 5));
+    assert!(allocator.check_shadow(unsafe { allocation.offset(4) }, 4));
+    assert!(allocator.check_shadow(unsafe { allocation.offset(5) }, 3));
+    assert!(allocator.check_shadow(unsafe { allocation.offset(6) }, 2));
+    assert!(allocator.check_shadow(unsafe { allocation.offset(7) }, 1));
+    assert!(allocator.check_shadow(unsafe { allocation.offset(8) }, 0));
+    assert!(!allocator.check_shadow(unsafe { allocation.offset(9) }, 1));
+    assert!(!allocator.check_shadow(unsafe { allocation.offset(9) }, 8));
+    assert!(!allocator.check_shadow(unsafe { allocation.offset(1) }, 9));
+    assert!(!allocator.check_shadow(unsafe { allocation.offset(1) }, 8));
+    assert!(!allocator.check_shadow(unsafe { allocation.offset(2) }, 8));
+    assert!(!allocator.check_shadow(unsafe { allocation.offset(3) }, 8));
+    let allocation = unsafe { allocator.alloc(0xc, 0) };
+    assert!(allocator.check_shadow(unsafe { allocation.offset(4) }, 8));
+    //subqword access
+    assert!(allocator.check_shadow(unsafe { allocation.offset(3) }, 2));
+    //unaligned access
+    assert!(allocator.check_shadow(unsafe { allocation.offset(3) }, 8));
+    let allocation = unsafe { allocator.alloc(0x20, 0) };
+    //access with unaligned parts at the beginning and end
+    assert!(allocator.check_shadow(unsafe { allocation.offset(10) }, 21));
+    //invalid, unaligned access
+    assert!(!allocator.check_shadow(unsafe { allocation.offset(10) }, 29));
+    let allocation = unsafe { allocator.alloc(4, 0) };
+    assert!(!allocation.is_null());
+    assert!(allocator.check_shadow(allocation, 1));
+    assert!(allocator.check_shadow(allocation, 2));
+    assert!(allocator.check_shadow(allocation, 3));
+    assert!(allocator.check_shadow(allocation, 4));
+    assert!(!allocator.check_shadow(allocation, 5));
+    assert!(!allocator.check_shadow(allocation, 6));
+    assert!(!allocator.check_shadow(allocation, 7));
+    assert!(!allocator.check_shadow(allocation, 8));
+    let allocation = unsafe { allocator.alloc(0xc, 0) };
+    assert!(allocator.check_shadow(unsafe { allocation.offset(4) }, 8));
+    let allocation = unsafe { allocator.alloc(0x3c, 0) };
+    assert!(allocator.check_shadow(unsafe { allocation.offset(0x3a) }, 2));
 }

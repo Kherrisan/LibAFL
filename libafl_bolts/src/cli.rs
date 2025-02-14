@@ -34,14 +34,12 @@
 //! use std::env;
 //!
 //! // make sure to add `features = ["qemu_cli"]` to the `libafl` crate in `Cargo.toml`
-//! use libafl_qemu::Emulator;
+//! use libafl_qemu::Qemu;
 //!
 //! fn fuzz_with_qemu(mut options: FuzzerOptions) {
 //!     env::remove_var("LD_LIBRARY_PATH");
 //!
-//!     let env: Vec<(String, String)> = env::vars().collect();
-//!
-//!     let emu = Emulator::new(&mut options.qemu_args.to_vec(), &mut env).unwrap();
+//!     let qemu = Qemu::init(&mut options.qemu_args.to_vec()).unwrap();
 //!     // do other stuff...
 //! }
 //!
@@ -70,6 +68,8 @@ use alloc::{string::String, vec::Vec};
 use std::error;
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
+#[cfg(feature = "frida_cli")]
+use clap::ValueEnum;
 use clap::{Command, CommandFactory, Parser};
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +104,17 @@ fn parse_instrumentation_location(
     ))
 }
 
+/// The scripting engine to use for JavaScript scripting support
+#[cfg(feature = "frida_cli")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash, ValueEnum, Default)]
+pub enum FridaScriptBackend {
+    /// The Google V8 engine
+    V8,
+    /// `QuickJS` by Fabrice Bellard
+    #[default]
+    QuickJS,
+}
+
 /// Top-level container for cli options/arguments/subcommands
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[command(
@@ -111,7 +122,7 @@ fn parse_instrumentation_location(
     subcommand_precedence_over_arg(true),
     args_conflicts_with_subcommands(true)
 )]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct FuzzerOptions {
     /// Timeout for each target execution (milliseconds)
     #[arg(short, long, default_value = "1000", value_parser = parse_timeout, help_heading = "Fuzz Options")]
@@ -302,6 +313,16 @@ pub struct FuzzerOptions {
         requires = "replay"
     )]
     pub repeat: Option<usize>,
+
+    /// The backend scripting engine to use for JavaScript scripting support
+    #[cfg(feature = "frida_cli")]
+    #[arg(long, help_heading = "Frida Options")]
+    pub backend: Option<FridaScriptBackend>,
+
+    /// The path to the Frida script to load into the target
+    #[cfg(feature = "frida_cli")]
+    #[arg(long, help_heading = "Frida Options")]
+    pub script: Option<PathBuf>,
 }
 
 impl FuzzerOptions {

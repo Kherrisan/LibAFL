@@ -1,7 +1,9 @@
 #[cfg(target_arch = "aarch64")]
 use frida_gum::instruction_writer::Aarch64Register;
 #[cfg(target_arch = "x86_64")]
-use frida_gum::instruction_writer::X86Register;
+use frida_gum::{instruction_writer::X86Register, CpuContext};
+#[cfg(target_arch = "x86_64")]
+use libafl::Error;
 #[cfg(target_arch = "aarch64")]
 use num_traits::cast::FromPrimitive;
 #[cfg(target_arch = "x86_64")]
@@ -158,13 +160,38 @@ const X86_64_REGS: [(RegSpec, X86Register); 34] = [
     (RegSpec::rip(), X86Register::Rip),
 ];
 
-/// The writer registers
-/// frida registers: <https://docs.rs/frida-gum/0.4.0/frida_gum/instruction_writer/enum.X86Register.html>
-/// capstone registers: <https://docs.rs/capstone-sys/0.14.0/capstone_sys/x86_reg/index.html>
+/// Get the value of a register given a context
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn get_register(context: &CpuContext, reg: X86Register) -> u64 {
+    match reg {
+        X86Register::Rax => context.rax(),
+        X86Register::Rbx => context.rbx(),
+        X86Register::Rcx => context.rcx(),
+        X86Register::Rdx => context.rdx(),
+        X86Register::Rdi => context.rdi(),
+        X86Register::Rsi => context.rsi(),
+        X86Register::Rsp => context.rsp(),
+        X86Register::Rbp => context.rbp(),
+        X86Register::R8 => context.r8(),
+        X86Register::R9 => context.r9(),
+        X86Register::R10 => context.r10(),
+        X86Register::R11 => context.r11(),
+        X86Register::R12 => context.r12(),
+        X86Register::R13 => context.r13(),
+        X86Register::R14 => context.r14(),
+        X86Register::R15 => context.r15(),
+        _ => 0,
+    }
+}
+
+/// The writer registers.
+///
+///  `FRIDA` registers: <https://docs.rs/frida-gum/latest/frida_gum/instruction_writer/enum.X86Register.html>
+/// `capstone` registers: <https://docs.rs/capstone-sys/latest/capstone_sys/x86_reg/index.html>
 #[cfg(target_arch = "x86_64")]
 #[must_use]
 #[inline]
-#[allow(clippy::unused_self)]
 pub fn writer_register(reg: RegSpec) -> X86Register {
     for (reg1, reg2) in &X86_64_REGS {
         // println!("reg1:{:#?} reg2:{:#?}", reg1, reg);
@@ -175,52 +202,82 @@ pub fn writer_register(reg: RegSpec) -> X86Register {
     X86Register::None
 }
 
-/// Translates a frida instruction to a disassembled instruction.
-#[cfg(all(target_arch = "x86_64", unix))]
-pub(crate) fn frida_to_cs(decoder: InstDecoder, frida_insn: &frida_gum_sys::Insn) -> Instruction {
-    decoder.decode_slice(frida_insn.bytes()).unwrap()
+/// Translates a `FRIDA` instruction to a disassembled instruction.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn frida_to_cs(
+    decoder: InstDecoder,
+    frida_insn: &frida_gum_sys::Insn,
+) -> Result<Instruction, Error> {
+    match decoder.decode_slice(frida_insn.bytes()) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            log::error!(
+                "{:?}: {:x}: {:?}",
+                error,
+                frida_insn.address(),
+                frida_insn.bytes()
+            );
+            Err(Error::illegal_state(
+                "Instruction did not disassemble properly",
+            ))
+        }
+    }
 }
 
+/// Get the `base`, `idx`, `scale`, `disp` for each operand
 #[cfg(target_arch = "x86_64")]
-/// Get the base, idx, scale, disp for each operand
+#[must_use]
 pub fn operand_details(operand: &Operand) -> Option<(X86Register, X86Register, u8, i32)> {
     match operand {
-        Operand::RegDeref(base) => {
+        Operand::MemDeref { base } => {
             let base = writer_register(*base);
             Some((base, X86Register::None, 0, 0))
         }
-        Operand::RegDisp(base, disp) => {
+        Operand::Disp { base, disp } => {
             let base = writer_register(*base);
             Some((base, X86Register::None, 0, *disp))
         }
-        Operand::RegScale(base, scale) => {
-            let base = writer_register(*base);
-            Some((base, X86Register::None, *scale, 0))
-        }
-        Operand::RegIndexBase(base, index) => {
-            let base = writer_register(*base);
+        Operand::MemIndexScale { index, scale } => {
             let index = writer_register(*index);
-            Some((base, index, 0, 0))
+            Some((X86Register::None, index, *scale, 0))
         }
-        Operand::RegIndexBaseDisp(base, index, disp) => {
-            let base = writer_register(*base);
+        Operand::MemIndexScaleDisp { index, scale, disp } => {
             let index = writer_register(*index);
-            Some((base, index, 0, *disp))
+            Some((X86Register::None, index, *scale, *disp))
         }
-        Operand::RegScaleDisp(base, scale, disp) => {
-            let base = writer_register(*base);
-            Some((base, X86Register::None, *scale, *disp))
-        }
-        Operand::RegIndexBaseScale(base, index, scale) => {
+        Operand::MemBaseIndexScale { base, index, scale } => {
             let base = writer_register(*base);
             let index = writer_register(*index);
             Some((base, index, *scale, 0))
         }
-        Operand::RegIndexBaseScaleDisp(base, index, scale, disp) => {
+        Operand::MemBaseIndexScaleDisp {
+            base,
+            index,
+            scale,
+            disp,
+        } => {
             let base = writer_register(*base);
             let index = writer_register(*index);
             Some((base, index, *scale, *disp))
         }
+        _ => None,
+    }
+}
+
+/// Get the immediate value of the operand
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn immediate_value(operand: &Operand) -> Option<i64> {
+    match operand {
+        Operand::ImmediateI8 { imm } => Some(i64::from(*imm)),
+        Operand::ImmediateU8 { imm } => Some(i64::from(*imm)),
+        Operand::ImmediateI16 { imm } => Some(i64::from(*imm)),
+        Operand::ImmediateU16 { imm } => Some(i64::from(*imm)),
+        Operand::ImmediateI32 { imm } => Some(i64::from(*imm)),
+        Operand::ImmediateU32 { imm } => Some(i64::from(*imm)),
+        Operand::ImmediateI64 { imm } => Some(*imm),
+        #[expect(clippy::cast_possible_wrap)]
+        Operand::ImmediateU64 { imm } => Some(*imm as i64),
         _ => None,
     }
 }
@@ -235,8 +292,9 @@ pub enum AccessType {
     Write,
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Disassemble "count" number of instructions
+#[cfg(target_arch = "x86_64")]
+#[must_use]
 pub fn disas_count(decoder: &InstDecoder, data: &[u8], count: usize) -> Vec<Instruction> {
     let mut counter = count;
     let mut ret = vec![];
@@ -257,6 +315,7 @@ pub fn disas_count(decoder: &InstDecoder, data: &[u8], count: usize) -> Vec<Inst
 
 #[cfg(target_arch = "aarch64")]
 /// Disassemble "count" number of instructions
+#[must_use]
 pub fn disas_count(decoder: &InstDecoder, data: &[u8], _count: usize) -> Vec<Instruction> {
     let mut ret = vec![];
 

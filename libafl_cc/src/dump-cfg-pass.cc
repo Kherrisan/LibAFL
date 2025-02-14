@@ -101,7 +101,11 @@ class DumpCfgPass : public ModulePass {
  private:
   bool isLLVMIntrinsicFn(StringRef &n) {
     // Not interested in these LLVM's functions
+#if LLVM_VERSION_MAJOR >= 18
+    if (n.starts_with("llvm.")) {
+#else
     if (n.startswith("llvm.")) {
+#endif
       return true;
     } else {
       return false;
@@ -117,14 +121,14 @@ llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "DumpCfgPass", "v0.1",
           /* lambda to insert our pass into the pass pipeline. */
           [](PassBuilder &PB) {
-
-  #if LLVM_VERSION_MAJOR <= 13
-            using OptimizationLevel = typename PassBuilder::OptimizationLevel;
-  #endif
             PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel OL) {
-                  MPM.addPass(DumpCfgPass());
-                });
+                [](ModulePassManager &MPM, OptimizationLevel OL
+  #if LLVM_VERSION_MAJOR >= 20
+                   ,
+                   ThinOrFullLTOPhase Phase
+  #endif
+
+                ) { MPM.addPass(DumpCfgPass()); });
           }};
 }
 #else

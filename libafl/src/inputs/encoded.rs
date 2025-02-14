@@ -1,5 +1,6 @@
-//! The `EncodedInput` is the "normal" input, a map of codes, that can be sent directly to the client
-//! (As opposed to other, more abstract, inputs, like an Grammar-Based AST Input)
+//! The `EncodedInput` is the "normal" input, a map of codes, that can be sent directly to the client.
+//!
+//! This is different to other, more abstract inputs, like an Grammar-Based AST Input.
 //! See also [the paper on token-level fuzzing](https://www.usenix.org/system/files/sec21-salls.pdf)
 
 #[cfg(feature = "regex")]
@@ -19,7 +20,7 @@ use libafl_bolts::{Error, HasLen};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::inputs::Input;
+use crate::{corpus::CorpusId, inputs::Input};
 
 /// Trait to encode bytes to an [`EncodedInput`] using the given [`Tokenizer`]
 pub trait InputEncoder<T>
@@ -33,7 +34,6 @@ where
 /// Trait to decode encoded input to bytes
 pub trait InputDecoder {
     /// Decode encoded input to bytes
-    #[allow(clippy::ptr_arg)] // we reuse the alloced `Vec`
     fn decode(&self, input: &EncodedInput, bytes: &mut Vec<u8>) -> Result<(), Error>;
 }
 
@@ -202,7 +202,7 @@ pub struct EncodedInput {
 impl Input for EncodedInput {
     /// Generate a name for this input
     #[must_use]
-    fn generate_name(&self, _idx: usize) -> String {
+    fn generate_name(&self, _id: Option<CorpusId>) -> String {
         let mut hasher = RandomState::with_seeds(0, 0, 0, 0).build_hasher();
         for code in &self.codes {
             hasher.write(&code.to_le_bytes());

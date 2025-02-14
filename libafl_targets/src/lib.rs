@@ -1,20 +1,7 @@
 //! `libafl_targets` contains runtime code, injected in the target itself during compilation.
 #![no_std]
-#![deny(rustdoc::broken_intra_doc_links)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-#![allow(
-    clippy::unreadable_literal,
-    clippy::type_repetition_in_bounds,
-    clippy::missing_errors_doc,
-    clippy::cast_possible_truncation,
-    clippy::used_underscore_binding,
-    clippy::ptr_as_ptr,
-    clippy::missing_panics_doc,
-    clippy::missing_docs_in_private_items,
-    clippy::module_name_repetitions,
-    clippy::pub_underscore_fields
-)]
+// For `std::simd`
+#![cfg_attr(nightly, feature(portable_simd))]
 #![cfg_attr(not(test), warn(
     missing_debug_implementations,
     missing_docs,
@@ -27,14 +14,12 @@
 ))]
 #![cfg_attr(test, deny(
     missing_debug_implementations,
-    missing_docs,
     //trivial_casts,
     trivial_numeric_casts,
     unused_extern_crates,
     unused_import_braces,
     unused_qualifications,
     unused_must_use,
-    missing_docs,
     //unused_results
 ))]
 #![cfg_attr(
@@ -60,15 +45,28 @@
 #[cfg(feature = "std")]
 #[macro_use]
 extern crate std;
+
 #[allow(unused_imports)]
 #[macro_use]
 extern crate alloc;
 
 include!(concat!(env!("OUT_DIR"), "/constants.rs"));
 
-#[cfg(any(feature = "sancov_pcguard_edges", feature = "sancov_pcguard_hitcounts",))]
+#[cfg(any(
+    feature = "sancov_pcguard_edges",
+    feature = "sancov_pcguard_hitcounts",
+    feature = "sancov_ngram4",
+    feature = "sancov_ngram8",
+    feature = "sancov_ctx"
+))]
 pub mod sancov_pcguard;
-#[cfg(any(feature = "sancov_pcguard_edges", feature = "sancov_pcguard_hitcounts",))]
+#[cfg(any(
+    feature = "sancov_pcguard_edges",
+    feature = "sancov_pcguard_hitcounts",
+    feature = "sancov_ngram4",
+    feature = "sancov_ngram8",
+    feature = "sancov_ctx"
+))]
 pub use sancov_pcguard::*;
 
 #[cfg(any(feature = "sancov_cmplog", feature = "sancov_value_profile"))]
@@ -87,6 +85,9 @@ pub mod sanitizer_ifaces {
     #![allow(clippy::unreadable_literal)]
     #![allow(missing_docs)]
     #![allow(missing_debug_implementations)]
+    #![allow(unused_qualifications)]
+    #![allow(clippy::pub_underscore_fields)]
+
     include!(concat!(env!("OUT_DIR"), "/sanitizer_interfaces.rs"));
 }
 
@@ -107,6 +108,12 @@ pub use coverage::*;
 
 pub mod value_profile;
 pub use value_profile::*;
+
+/// The module to hook call instructions
+#[cfg(feature = "function-logging")]
+pub mod call;
+#[cfg(feature = "function-logging")]
+pub use call::*;
 
 /// runtime related to comparisons
 pub mod cmps;

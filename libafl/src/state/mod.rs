@@ -1,7 +1,9 @@
 //! The fuzzer, and state are the core pieces of every good fuzzer
 
+#[cfg(feature = "std")]
 use alloc::vec::Vec;
 use core::{
+    borrow::BorrowMut,
     cell::{Ref, RefMut},
     fmt::Debug,
     marker::PhantomData,
@@ -13,67 +15,68 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "std")]
+use libafl_bolts::core_affinity::{CoreId, Cores};
 use libafl_bolts::{
-    rands::Rand,
-    serdeany::{NamedSerdeAnyMap, SerdeAny, SerdeAnyMap},
+    rands::{Rand, StdRand},
+    serdeany::{NamedSerdeAnyMap, SerdeAnyMap},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+mod stack;
+pub use stack::StageStack;
+
 #[cfg(feature = "introspection")]
-use crate::monitors::ClientPerfMonitor;
-#[cfg(feature = "scalability_introspection")]
-use crate::monitors::ScalabilityMonitor;
+use crate::monitors::stats::ClientPerfStats;
 use crate::{
-    corpus::{Corpus, CorpusId, HasCurrentCorpusIdx, HasTestcase, Testcase},
+    corpus::{Corpus, CorpusId, HasCurrentCorpusId, HasTestcase, InMemoryCorpus, Testcase},
     events::{Event, EventFirer, LogSeverity},
-    feedbacks::Feedback,
+    feedbacks::StateInitializer,
     fuzzer::{Evaluator, ExecuteInputResult},
     generators::Generator,
-    inputs::{Input, UsesInput},
-    stages::{HasCurrentStage, HasNestedStageStatus},
-    Error,
+    inputs::{Input, NopInput},
+    stages::{HasCurrentStageId, HasNestedStageStatus, StageId},
+    Error, HasMetadata, HasNamedMetadata,
 };
 
 /// The maximum size of a testcase
 pub const DEFAULT_MAX_SIZE: usize = 1_048_576;
 
-/// The [`State`] of the fuzzer.
-/// Contains all important information about the current run.
-/// Will be used to restart the fuzzing process at any time.
-pub trait State:
-    UsesInput
-    + Serialize
-    + DeserializeOwned
-    + MaybeHasClientPerfMonitor
-    + MaybeHasScalabilityMonitor
-    + HasCurrentCorpusIdx
-    + HasCurrentStage
-{
-}
-
-/// Structs which implement this trait are aware of the state. This is used for type enforcement.
-pub trait UsesState: UsesInput<Input = <Self::State as UsesInput>::Input> {
-    /// The state known by this type.
-    type State: State;
-}
-
-// blanket impl which automatically defines UsesInput for anything that implements UsesState
-impl<KS> UsesInput for KS
-where
-    KS: UsesState,
-{
-    type Input = <KS::State as UsesInput>::Input;
-}
-
 /// Trait for elements offering a corpus
-pub trait HasCorpus: UsesInput {
+pub trait HasCorpus<I> {
     /// The associated type implementing [`Corpus`].
-    type Corpus: Corpus<Input = <Self as UsesInput>::Input>;
+    type Corpus: Corpus<I>;
 
     /// The testcase corpus
     fn corpus(&self) -> &Self::Corpus;
     /// The testcase corpus (mutable)
     fn corpus_mut(&mut self) -> &mut Self::Corpus;
+}
+
+/// The trait that implements the very standard capability of a state.
+/// This state contains important information about the current run
+/// and can be used to restart the fuzzing process at any time.
+///
+/// This [`State`] is here for documentation purpose.
+/// You should *NOT* implement this trait for any of your struct,
+/// but when you implement your customized state, you can look at this trait to see what would be needed.
+#[allow(dead_code)]
+trait State:
+    Serialize
+    + DeserializeOwned
+    + MaybeHasClientPerfMonitor
+    + HasCurrentCorpusId
+    + HasCurrentStageId
+    + Stoppable
+{
+}
+
+impl<C, I, R, SC> State for StdState<C, I, R, SC>
+where
+    C: Serialize + DeserializeOwned,
+    R: Rand,
+    SC: Serialize + DeserializeOwned,
+{
 }
 
 /// Interact with the maximum size
@@ -85,9 +88,9 @@ pub trait HasMaxSize {
 }
 
 /// Trait for elements offering a corpus of solutions
-pub trait HasSolutions: UsesInput {
+pub trait HasSolutions<I> {
     /// The associated type implementing [`Corpus`] for solutions
-    type Solutions: Corpus<Input = <Self as UsesInput>::Input>;
+    type Solutions: Corpus<I>;
 
     /// The solutions corpus
     fn solutions(&self) -> &Self::Solutions;
@@ -106,13 +109,13 @@ pub trait HasRand {
 }
 
 #[cfg(feature = "introspection")]
-/// Trait for offering a [`ClientPerfMonitor`]
+/// Trait for offering a [`ClientPerfStats`]
 pub trait HasClientPerfMonitor {
-    /// [`ClientPerfMonitor`] itself
-    fn introspection_monitor(&self) -> &ClientPerfMonitor;
+    /// [`ClientPerfStats`] itself
+    fn introspection_stats(&self) -> &ClientPerfStats;
 
-    /// Mutatable ref to [`ClientPerfMonitor`]
-    fn introspection_monitor_mut(&mut self) -> &mut ClientPerfMonitor;
+    /// Mutatable ref to [`ClientPerfStats`]
+    fn introspection_stats_mut(&mut self) -> &mut ClientPerfStats;
 }
 
 /// Intermediate trait for `HasClientPerfMonitor`
@@ -129,134 +132,13 @@ impl<T> MaybeHasClientPerfMonitor for T {}
 #[cfg(feature = "introspection")]
 impl<T> MaybeHasClientPerfMonitor for T where T: HasClientPerfMonitor {}
 
-/// Intermediate trait for `HasScalabilityMonitor`
-#[cfg(feature = "scalability_introspection")]
-pub trait MaybeHasScalabilityMonitor: HasScalabilityMonitor {}
-/// Intermediate trait for `HasScalabilityMonitor`
-#[cfg(not(feature = "scalability_introspection"))]
-pub trait MaybeHasScalabilityMonitor {}
-
-#[cfg(not(feature = "scalability_introspection"))]
-impl<T> MaybeHasScalabilityMonitor for T {}
-
-#[cfg(feature = "scalability_introspection")]
-impl<T> MaybeHasScalabilityMonitor for T where T: HasScalabilityMonitor {}
-
-/// Trait for offering a [`ScalabilityMonitor`]
-#[cfg(feature = "scalability_introspection")]
-pub trait HasScalabilityMonitor {
-    /// Ref to [`ScalabilityMonitor`]
-    fn scalability_monitor(&self) -> &ScalabilityMonitor;
-
-    /// Mutable ref to [`ScalabilityMonitor`]
-    fn scalability_monitor_mut(&mut self) -> &mut ScalabilityMonitor;
-}
-
-/// Trait for elements offering metadata
-pub trait HasMetadata {
-    /// A map, storing all metadata
-    fn metadata_map(&self) -> &SerdeAnyMap;
-    /// A map, storing all metadata (mutable)
-    fn metadata_map_mut(&mut self) -> &mut SerdeAnyMap;
-
-    /// Add a metadata to the metadata map
-    #[inline]
-    fn add_metadata<M>(&mut self, meta: M)
-    where
-        M: SerdeAny,
-    {
-        self.metadata_map_mut().insert(meta);
-    }
-
-    /// Check for a metadata
-    #[inline]
-    fn has_metadata<M>(&self) -> bool
-    where
-        M: SerdeAny,
-    {
-        self.metadata_map().get::<M>().is_some()
-    }
-
-    /// To get metadata
-    #[inline]
-    fn metadata<M>(&self) -> Result<&M, Error>
-    where
-        M: SerdeAny,
-    {
-        self.metadata_map().get::<M>().ok_or_else(|| {
-            Error::key_not_found(format!("{} not found", core::any::type_name::<M>()))
-        })
-    }
-
-    /// To get mutable metadata
-    #[inline]
-    fn metadata_mut<M>(&mut self) -> Result<&mut M, Error>
-    where
-        M: SerdeAny,
-    {
-        self.metadata_map_mut().get_mut::<M>().ok_or_else(|| {
-            Error::key_not_found(format!("{} not found", core::any::type_name::<M>()))
-        })
-    }
-}
-
-/// Trait for elements offering named metadata
-pub trait HasNamedMetadata {
-    /// A map, storing all metadata
-    fn named_metadata_map(&self) -> &NamedSerdeAnyMap;
-    /// A map, storing all metadata (mutable)
-    fn named_metadata_map_mut(&mut self) -> &mut NamedSerdeAnyMap;
-
-    /// Add a metadata to the metadata map
-    #[inline]
-    fn add_named_metadata<M>(&mut self, meta: M, name: &str)
-    where
-        M: SerdeAny,
-    {
-        self.named_metadata_map_mut().insert(meta, name);
-    }
-
-    /// Check for a metadata
-    #[inline]
-    fn has_named_metadata<M>(&self, name: &str) -> bool
-    where
-        M: SerdeAny,
-    {
-        self.named_metadata_map().contains::<M>(name)
-    }
-
-    /// To get named metadata
-    #[inline]
-    fn named_metadata<M>(&self, name: &str) -> Result<&M, Error>
-    where
-        M: SerdeAny,
-    {
-        self.named_metadata_map().get::<M>(name).ok_or_else(|| {
-            Error::key_not_found(format!("{} not found", core::any::type_name::<M>()))
-        })
-    }
-
-    /// To get mutable named metadata
-    #[inline]
-    fn named_metadata_mut<M>(&mut self, name: &str) -> Result<&mut M, Error>
-    where
-        M: SerdeAny,
-    {
-        self.named_metadata_map_mut()
-            .get_mut::<M>(name)
-            .ok_or_else(|| {
-                Error::key_not_found(format!("{} not found", core::any::type_name::<M>()))
-            })
-    }
-}
-
 /// Trait for the execution counter
 pub trait HasExecutions {
     /// The executions counter
-    fn executions(&self) -> &usize;
+    fn executions(&self) -> &u64;
 
     /// The executions counter (mutable)
-    fn executions_mut(&mut self) -> &mut usize;
+    fn executions_mut(&mut self) -> &mut u64;
 }
 
 /// Trait for some stats of AFL
@@ -278,6 +160,15 @@ pub trait HasStartTime {
 }
 
 /// Trait for the last report time, the last time this node reported progress
+pub trait HasLastFoundTime {
+    /// The last time we found something by ourselves
+    fn last_found_time(&self) -> &Duration;
+
+    /// The last time we found something by ourselves (mutable)
+    fn last_found_time_mut(&mut self) -> &mut Duration;
+}
+
+/// Trait for the last report time, the last time this node reported progress
 pub trait HasLastReportTime {
     /// The last time we reported progress,if available/used.
     /// This information is used by fuzzer `maybe_report_progress`.
@@ -288,6 +179,24 @@ pub trait HasLastReportTime {
     fn last_report_time_mut(&mut self) -> &mut Option<Duration>;
 }
 
+/// Struct that holds the options for input loading
+#[cfg(feature = "std")]
+pub struct LoadConfig<'a, I, S, Z> {
+    /// Load Input even if it was deemed "uninteresting" by the fuzzer
+    forced: bool,
+    /// Function to load input from a Path
+    loader: &'a mut dyn FnMut(&mut Z, &mut S, &Path) -> Result<I, Error>,
+    /// Error if Input leads to a Solution.
+    exit_on_solution: bool,
+}
+
+#[cfg(feature = "std")]
+impl<I, S, Z> Debug for LoadConfig<'_, I, S, Z> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "LoadConfig {{}}")
+    }
+}
+
 /// The state a fuzz run.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(bound = "
@@ -295,11 +204,11 @@ pub trait HasLastReportTime {
         SC: serde::Serialize + for<'a> serde::Deserialize<'a>,
         R: serde::Serialize + for<'a> serde::Deserialize<'a>
     ")]
-pub struct StdState<I, C, R, SC> {
+pub struct StdState<C, I, R, SC> {
     /// RNG instance
     rand: R,
     /// How many times the executor ran the harness/target
-    executions: usize,
+    executions: u64,
     /// At what time the fuzzing started
     start_time: Duration,
     /// the number of new paths that imported from other fuzzers
@@ -312,48 +221,36 @@ pub struct StdState<I, C, R, SC> {
     metadata: SerdeAnyMap,
     /// Metadata stored with names
     named_metadata: NamedSerdeAnyMap,
-    /// MaxSize testcase size for mutators that appreciate it
+    /// `MaxSize` testcase size for mutators that appreciate it
     max_size: usize,
     /// Performance statistics for this fuzzer
     #[cfg(feature = "introspection")]
-    introspection_monitor: ClientPerfMonitor,
-    #[cfg(feature = "scalability_introspection")]
-    scalability_monitor: ScalabilityMonitor,
+    introspection_stats: ClientPerfStats,
     #[cfg(feature = "std")]
     /// Remaining initial inputs to load, if any
     remaining_initial_files: Option<Vec<PathBuf>>,
     #[cfg(feature = "std")]
-    /// Remaining initial inputs to load, if any
+    /// symlinks we have already traversed when loading `remaining_initial_files`
     dont_reenter: Option<Vec<PathBuf>>,
+    #[cfg(feature = "std")]
+    /// If inputs have been processed for multicore loading
+    /// relevant only for `load_initial_inputs_multicore`
+    multicore_inputs_processed: Option<bool>,
     /// The last time we reported progress (if available/used).
     /// This information is used by fuzzer `maybe_report_progress`.
     last_report_time: Option<Duration>,
+    /// The last time something was added to the corpus
+    last_found_time: Duration,
     /// The current index of the corpus; used to record for resumable fuzzing.
-    corpus_idx: Option<CorpusId>,
-    /// The stage indexes for each nesting of stages
-    stage_idx_stack: Vec<usize>,
-    /// The current stage depth
-    stage_depth: usize,
+    corpus_id: Option<CorpusId>,
+    /// Request the fuzzer to stop at the start of the next stage
+    /// or at the beginning of the next fuzzing iteration
+    stop_requested: bool,
+    stage_stack: StageStack,
     phantom: PhantomData<I>,
 }
 
-impl<I, C, R, SC> UsesInput for StdState<I, C, R, SC>
-where
-    I: Input,
-{
-    type Input = I;
-}
-
-impl<I, C, R, SC> State for StdState<I, C, R, SC>
-where
-    C: Corpus<Input = Self::Input>,
-    R: Rand,
-    SC: Corpus<Input = Self::Input>,
-    Self: UsesInput,
-{
-}
-
-impl<I, C, R, SC> HasRand for StdState<I, C, R, SC>
+impl<C, I, R, SC> HasRand for StdState<C, I, R, SC>
 where
     R: Rand,
 {
@@ -372,11 +269,9 @@ where
     }
 }
 
-impl<I, C, R, SC> HasCorpus for StdState<I, C, R, SC>
+impl<C, I, R, SC> HasCorpus<I> for StdState<C, I, R, SC>
 where
-    I: Input,
-    C: Corpus<Input = <Self as UsesInput>::Input>,
-    R: Rand,
+    C: Corpus<I>,
 {
     type Corpus = C;
 
@@ -393,30 +288,26 @@ where
     }
 }
 
-impl<I, C, R, SC> HasTestcase for StdState<I, C, R, SC>
+impl<C, I, R, SC> HasTestcase<I> for StdState<C, I, R, SC>
 where
-    I: Input,
-    C: Corpus<Input = <Self as UsesInput>::Input>,
-    R: Rand,
+    C: Corpus<I>,
 {
     /// To get the testcase
-    fn testcase(&self, id: CorpusId) -> Result<Ref<Testcase<<Self as UsesInput>::Input>>, Error> {
+    fn testcase(&self, id: CorpusId) -> Result<Ref<'_, Testcase<I>>, Error> {
         Ok(self.corpus().get(id)?.borrow())
     }
 
     /// To get mutable testcase
-    fn testcase_mut(
-        &self,
-        id: CorpusId,
-    ) -> Result<RefMut<Testcase<<Self as UsesInput>::Input>>, Error> {
+    fn testcase_mut(&self, id: CorpusId) -> Result<RefMut<'_, Testcase<I>>, Error> {
         Ok(self.corpus().get(id)?.borrow_mut())
     }
 }
 
-impl<I, C, R, SC> HasSolutions for StdState<I, C, R, SC>
+impl<C, I, R, SC> HasSolutions<I> for StdState<C, I, R, SC>
 where
+    C: Corpus<I>,
     I: Input,
-    SC: Corpus<Input = <Self as UsesInput>::Input>,
+    SC: Corpus<I>,
 {
     type Solutions = SC;
 
@@ -433,7 +324,7 @@ where
     }
 }
 
-impl<I, C, R, SC> HasMetadata for StdState<I, C, R, SC> {
+impl<C, I, R, SC> HasMetadata for StdState<C, I, R, SC> {
     /// Get all the metadata into an [`hashbrown::HashMap`]
     #[inline]
     fn metadata_map(&self) -> &SerdeAnyMap {
@@ -447,7 +338,7 @@ impl<I, C, R, SC> HasMetadata for StdState<I, C, R, SC> {
     }
 }
 
-impl<I, C, R, SC> HasNamedMetadata for StdState<I, C, R, SC> {
+impl<C, I, R, SC> HasNamedMetadata for StdState<C, I, R, SC> {
     /// Get all the metadata into an [`hashbrown::HashMap`]
     #[inline]
     fn named_metadata_map(&self) -> &NamedSerdeAnyMap {
@@ -461,21 +352,21 @@ impl<I, C, R, SC> HasNamedMetadata for StdState<I, C, R, SC> {
     }
 }
 
-impl<I, C, R, SC> HasExecutions for StdState<I, C, R, SC> {
+impl<C, I, R, SC> HasExecutions for StdState<C, I, R, SC> {
     /// The executions counter
     #[inline]
-    fn executions(&self) -> &usize {
+    fn executions(&self) -> &u64 {
         &self.executions
     }
 
     /// The executions counter (mutable)
     #[inline]
-    fn executions_mut(&mut self) -> &mut usize {
+    fn executions_mut(&mut self) -> &mut u64 {
         &mut self.executions
     }
 }
 
-impl<I, C, R, SC> HasImported for StdState<I, C, R, SC> {
+impl<C, I, R, SC> HasImported for StdState<C, I, R, SC> {
     /// Return the number of new paths that imported from other fuzzers
     #[inline]
     fn imported(&self) -> &usize {
@@ -489,7 +380,21 @@ impl<I, C, R, SC> HasImported for StdState<I, C, R, SC> {
     }
 }
 
-impl<I, C, R, SC> HasLastReportTime for StdState<I, C, R, SC> {
+impl<C, I, R, SC> HasLastFoundTime for StdState<C, I, R, SC> {
+    /// Return the number of new paths that imported from other fuzzers
+    #[inline]
+    fn last_found_time(&self) -> &Duration {
+        &self.last_found_time
+    }
+
+    /// Return the number of new paths that imported from other fuzzers
+    #[inline]
+    fn last_found_time_mut(&mut self) -> &mut Duration {
+        &mut self.last_found_time
+    }
+}
+
+impl<C, I, R, SC> HasLastReportTime for StdState<C, I, R, SC> {
     /// The last time we reported progress,if available/used.
     /// This information is used by fuzzer `maybe_report_progress`.
     fn last_report_time(&self) -> &Option<Duration> {
@@ -503,7 +408,7 @@ impl<I, C, R, SC> HasLastReportTime for StdState<I, C, R, SC> {
     }
 }
 
-impl<I, C, R, SC> HasMaxSize for StdState<I, C, R, SC> {
+impl<C, I, R, SC> HasMaxSize for StdState<C, I, R, SC> {
     fn max_size(&self) -> usize {
         self.max_size
     }
@@ -513,7 +418,7 @@ impl<I, C, R, SC> HasMaxSize for StdState<I, C, R, SC> {
     }
 }
 
-impl<I, C, R, SC> HasStartTime for StdState<I, C, R, SC> {
+impl<C, I, R, SC> HasStartTime for StdState<C, I, R, SC> {
     /// The starting time
     #[inline]
     fn start_time(&self) -> &Duration {
@@ -527,70 +432,140 @@ impl<I, C, R, SC> HasStartTime for StdState<I, C, R, SC> {
     }
 }
 
-impl<I, C, R, SC> HasCurrentCorpusIdx for StdState<I, C, R, SC> {
-    fn set_corpus_idx(&mut self, idx: CorpusId) -> Result<(), Error> {
-        self.corpus_idx = Some(idx);
+impl<C, I, R, SC> HasCurrentCorpusId for StdState<C, I, R, SC> {
+    fn set_corpus_id(&mut self, id: CorpusId) -> Result<(), Error> {
+        self.corpus_id = Some(id);
         Ok(())
     }
 
-    fn clear_corpus_idx(&mut self) -> Result<(), Error> {
-        self.corpus_idx = None;
+    fn clear_corpus_id(&mut self) -> Result<(), Error> {
+        self.corpus_id = None;
         Ok(())
     }
 
-    fn current_corpus_idx(&self) -> Result<Option<CorpusId>, Error> {
-        Ok(self.corpus_idx)
+    fn current_corpus_id(&self) -> Result<Option<CorpusId>, Error> {
+        Ok(self.corpus_id)
     }
 }
 
-impl<I, C, R, SC> HasCurrentStage for StdState<I, C, R, SC> {
-    fn set_stage(&mut self, idx: usize) -> Result<(), Error> {
-        // ensure we are in the right frame
-        if self.stage_depth != self.stage_idx_stack.len() {
-            return Err(Error::illegal_state(
-                "stage not resumed before setting stage",
+/// Has information about the current [`Testcase`] we are fuzzing
+pub trait HasCurrentTestcase<I>: HasCorpus<I> {
+    /// Gets the current [`Testcase`] we are fuzzing
+    ///
+    /// Will return [`Error::key_not_found`] if no `corpus_id` is currently set.
+    fn current_testcase(&self) -> Result<Ref<'_, Testcase<I>>, Error>;
+    //fn current_testcase(&self) -> Result<&Testcase<I>, Error>;
+
+    /// Gets the current [`Testcase`] we are fuzzing (mut)
+    ///
+    /// Will return [`Error::key_not_found`] if no `corpus_id` is currently set.
+    fn current_testcase_mut(&self) -> Result<RefMut<'_, Testcase<I>>, Error>;
+    //fn current_testcase_mut(&self) -> Result<&mut Testcase<I>, Error>;
+
+    /// Gets a cloned representation of the current [`Testcase`].
+    ///
+    /// Will return [`Error::key_not_found`] if no `corpus_id` is currently set.
+    ///
+    /// # Note
+    /// This allocates memory and copies the contents!
+    /// For performance reasons, if you just need to access the testcase, use [`Self::current_testcase`] instead.
+    fn current_input_cloned(&self) -> Result<I, Error>;
+}
+
+impl<I, T> HasCurrentTestcase<I> for T
+where
+    T: HasCorpus<I> + HasCurrentCorpusId,
+    I: Clone,
+{
+    fn current_testcase(&self) -> Result<Ref<'_, Testcase<I>>, Error> {
+        let Some(corpus_id) = self.current_corpus_id()? else {
+            return Err(Error::key_not_found(
+                "We are not currently processing a testcase",
             ));
-        }
-        self.stage_idx_stack.push(idx);
-        Ok(())
+        };
+
+        Ok(self.corpus().get(corpus_id)?.borrow())
     }
 
-    fn clear_stage(&mut self) -> Result<(), Error> {
-        self.stage_idx_stack.truncate(self.stage_depth);
-        Ok(())
+    fn current_testcase_mut(&self) -> Result<RefMut<'_, Testcase<I>>, Error> {
+        let Some(corpus_id) = self.current_corpus_id()? else {
+            return Err(Error::illegal_state(
+                "We are not currently processing a testcase",
+            ));
+        };
+
+        Ok(self.corpus().get(corpus_id)?.borrow_mut())
     }
 
-    fn current_stage(&self) -> Result<Option<usize>, Error> {
-        Ok(self.stage_idx_stack.get(self.stage_depth).copied())
+    fn current_input_cloned(&self) -> Result<I, Error> {
+        let mut testcase = self.current_testcase_mut()?;
+        Ok(testcase.borrow_mut().load_input(self.corpus())?.clone())
+    }
+}
+
+/// A trait for types that want to expose a stop API
+pub trait Stoppable {
+    /// Check if stop is requested
+    fn stop_requested(&self) -> bool;
+
+    /// Request to stop
+    fn request_stop(&mut self);
+
+    /// Discard the stop request
+    fn discard_stop_request(&mut self);
+}
+
+impl<C, I, R, SC> Stoppable for StdState<C, I, R, SC> {
+    fn request_stop(&mut self) {
+        self.stop_requested = true;
+    }
+
+    fn discard_stop_request(&mut self) {
+        self.stop_requested = false;
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+}
+
+impl<C, I, R, SC> HasCurrentStageId for StdState<C, I, R, SC> {
+    fn set_current_stage_id(&mut self, idx: StageId) -> Result<(), Error> {
+        self.stage_stack.set_current_stage_id(idx)
+    }
+
+    fn clear_stage_id(&mut self) -> Result<(), Error> {
+        self.stage_stack.clear_stage_id()
+    }
+
+    fn current_stage_id(&self) -> Result<Option<StageId>, Error> {
+        self.stage_stack.current_stage_id()
     }
 
     fn on_restart(&mut self) -> Result<(), Error> {
-        self.stage_depth = 0; // reset the stage depth so that we may resume inward
-        Ok(())
+        self.stage_stack.on_restart()
     }
 }
 
-impl<I, C, R, SC> HasNestedStageStatus for StdState<I, C, R, SC> {
+impl<C, I, R, SC> HasNestedStageStatus for StdState<C, I, R, SC> {
     fn enter_inner_stage(&mut self) -> Result<(), Error> {
-        self.stage_depth += 1;
-        Ok(())
+        self.stage_stack.enter_inner_stage()
     }
 
     fn exit_inner_stage(&mut self) -> Result<(), Error> {
-        self.stage_depth -= 1;
-        Ok(())
+        self.stage_stack.exit_inner_stage()
     }
 }
 
 #[cfg(feature = "std")]
-impl<C, I, R, SC> StdState<I, C, R, SC>
+impl<C, I, R, SC> StdState<C, I, R, SC>
 where
+    C: Corpus<I>,
     I: Input,
-    C: Corpus<Input = <Self as UsesInput>::Input>,
     R: Rand,
-    SC: Corpus<Input = <Self as UsesInput>::Input>,
+    SC: Corpus<I>,
 {
-    /// Decide if the state nust load the inputs
+    /// Decide if the state must load the inputs
     pub fn must_load_initial_inputs(&self) -> bool {
         self.corpus().count() == 0
             || (self.remaining_initial_files.is_some()
@@ -605,7 +580,7 @@ where
                 if filename.starts_with('.')
                 // || filename
                 //     .rsplit_once('-')
-                //     .map_or(false, |(_, s)| u64::from_str(s).is_ok())
+                //     .is_some_and(|(_, s)| u64::from_str(s).is_ok())
                 {
                     continue;
                 }
@@ -642,22 +617,14 @@ where
         }
     }
 
-    /// Loads initial inputs from the passed-in `in_dirs`.
-    /// If `forced` is true, will add all testcases, no matter what.
-    fn load_initial_inputs_custom<E, EM, Z>(
-        &mut self,
-        fuzzer: &mut Z,
-        executor: &mut E,
-        manager: &mut EM,
-        in_dirs: &[PathBuf],
-        forced: bool,
-        loader: &mut dyn FnMut(&mut Z, &mut Self, &Path) -> Result<I, Error>,
-    ) -> Result<(), Error>
-    where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        Z: Evaluator<E, EM, State = Self>,
-    {
+    /// Resets the state of initial files.
+    fn reset_initial_files_state(&mut self) {
+        self.remaining_initial_files = None;
+        self.dont_reenter = None;
+    }
+
+    /// Sets canonical paths for provided inputs
+    fn canonicalize_input_dirs(&mut self, in_dirs: &[PathBuf]) -> Result<(), Error> {
         if let Some(remaining) = self.remaining_initial_files.as_ref() {
             // everything was loaded
             if remaining.is_empty() {
@@ -673,8 +640,7 @@ where
             self.dont_reenter = Some(files.clone());
             self.remaining_initial_files = Some(files);
         }
-
-        self.continue_loading_initial_inputs_custom(fuzzer, executor, manager, forced, loader)
+        Ok(())
     }
 
     /// Loads initial inputs from the passed-in `in_dirs`.
@@ -686,13 +652,11 @@ where
         executor: &mut E,
         manager: &mut EM,
         file_list: &[PathBuf],
-        forced: bool,
-        loader: &mut dyn FnMut(&mut Z, &mut Self, &Path) -> Result<I, Error>,
+        load_config: LoadConfig<I, Self, Z>,
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
         if let Some(remaining) = self.remaining_initial_files.as_ref() {
             // everything was loaded
@@ -703,37 +667,64 @@ where
             self.remaining_initial_files = Some(file_list.to_vec());
         }
 
-        self.continue_loading_initial_inputs_custom(fuzzer, executor, manager, forced, loader)
+        self.continue_loading_initial_inputs_custom(fuzzer, executor, manager, load_config)
     }
 
+    fn load_file<E, EM, Z>(
+        &mut self,
+        path: &PathBuf,
+        manager: &mut EM,
+        fuzzer: &mut Z,
+        executor: &mut E,
+        config: &mut LoadConfig<I, Self, Z>,
+    ) -> Result<ExecuteInputResult, Error>
+    where
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
+    {
+        log::info!("Loading file {path:?} ...");
+        let input = match (config.loader)(fuzzer, self, path) {
+            Ok(input) => input,
+            Err(err) => {
+                log::error!("Skipping input that we could not load from {path:?}: {err:?}");
+                return Ok(ExecuteInputResult::None);
+            }
+        };
+        if config.forced {
+            let _: CorpusId = fuzzer.add_input(self, executor, manager, input)?;
+            Ok(ExecuteInputResult::Corpus)
+        } else {
+            let (res, _) = fuzzer.evaluate_input(self, executor, manager, &input)?;
+            if res == ExecuteInputResult::None {
+                fuzzer.add_disabled_input(self, input)?;
+                log::warn!("input {:?} was not interesting, adding as disabled.", &path);
+            }
+            Ok(res)
+        }
+    }
     /// Loads initial inputs from the passed-in `in_dirs`.
-    /// If `forced` is true, will add all testcases, no matter what.
-    /// This method takes a list of files.
+    /// This method takes a list of files and a `LoadConfig`
+    /// which specifies the special handling of initial inputs
     fn continue_loading_initial_inputs_custom<E, EM, Z>(
         &mut self,
         fuzzer: &mut Z,
         executor: &mut E,
         manager: &mut EM,
-        forced: bool,
-        loader: &mut dyn FnMut(&mut Z, &mut Self, &Path) -> Result<I, Error>,
+        mut config: LoadConfig<I, Self, Z>,
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
         loop {
             match self.next_file() {
                 Ok(path) => {
-                    log::info!("Loading file {:?} ...", &path);
-                    let input = loader(fuzzer, self, &path)?;
-                    if forced {
-                        let _: CorpusId = fuzzer.add_input(self, executor, manager, input)?;
-                    } else {
-                        let (res, _) = fuzzer.evaluate_input(self, executor, manager, input)?;
-                        if res == ExecuteInputResult::None {
-                            log::warn!("File {:?} was not interesting, skipped.", &path);
-                        }
+                    let res = self.load_file(&path, manager, fuzzer, executor, &mut config)?;
+                    if config.exit_on_solution && matches!(res, ExecuteInputResult::Solution) {
+                        return Err(Error::invalid_corpus(format!(
+                            "Input {} resulted in a solution.",
+                            path.display()
+                        )));
                     }
                 }
                 Err(Error::IteratorEnd(_, _)) => break,
@@ -752,6 +743,28 @@ where
         Ok(())
     }
 
+    /// Recursively walk supplied corpus directories
+    pub fn walk_initial_inputs<F>(
+        &mut self,
+        in_dirs: &[PathBuf],
+        mut closure: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&PathBuf) -> Result<(), Error>,
+    {
+        self.canonicalize_input_dirs(in_dirs)?;
+        loop {
+            match self.next_file() {
+                Ok(path) => {
+                    closure(&path)?;
+                }
+                Err(Error::IteratorEnd(_, _)) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        self.reset_initial_files_state();
+        Ok(())
+    }
     /// Loads all intial inputs, even if they are not considered `interesting`.
     /// This is rarely the right method, use `load_initial_inputs`,
     /// and potentially fix your `Feedback`, instead.
@@ -764,17 +777,19 @@ where
         file_list: &[PathBuf],
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
         self.load_initial_inputs_custom_by_filenames(
             fuzzer,
             executor,
             manager,
             file_list,
-            false,
-            &mut |_, _, path| I::from_file(path),
+            LoadConfig {
+                loader: &mut |_, _, path| I::from_file(path),
+                forced: false,
+                exit_on_solution: false,
+            },
         )
     }
 
@@ -789,20 +804,21 @@ where
         in_dirs: &[PathBuf],
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
-        self.load_initial_inputs_custom(
+        self.canonicalize_input_dirs(in_dirs)?;
+        self.continue_loading_initial_inputs_custom(
             fuzzer,
             executor,
             manager,
-            in_dirs,
-            true,
-            &mut |_, _, path| I::from_file(path),
+            LoadConfig {
+                loader: &mut |_, _, path| I::from_file(path),
+                forced: true,
+                exit_on_solution: false,
+            },
         )
     }
-
     /// Loads initial inputs from the passed-in `in_dirs`.
     /// If `forced` is true, will add all testcases, no matter what.
     /// This method takes a list of files, instead of folders.
@@ -814,17 +830,19 @@ where
         file_list: &[PathBuf],
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
         self.load_initial_inputs_custom_by_filenames(
             fuzzer,
             executor,
             manager,
             file_list,
-            true,
-            &mut |_, _, path| I::from_file(path),
+            LoadConfig {
+                loader: &mut |_, _, path| I::from_file(path),
+                forced: true,
+                exit_on_solution: false,
+            },
         )
     }
 
@@ -837,27 +855,156 @@ where
         in_dirs: &[PathBuf],
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
-        self.load_initial_inputs_custom(
+        self.canonicalize_input_dirs(in_dirs)?;
+        self.continue_loading_initial_inputs_custom(
             fuzzer,
             executor,
             manager,
-            in_dirs,
-            false,
-            &mut |_, _, path| I::from_file(path),
+            LoadConfig {
+                loader: &mut |_, _, path| I::from_file(path),
+                forced: false,
+                exit_on_solution: false,
+            },
         )
+    }
+
+    /// Loads initial inputs from the passed-in `in_dirs`.
+    /// Will return a `CorpusError` if a solution is found
+    pub fn load_initial_inputs_disallow_solution<E, EM, Z>(
+        &mut self,
+        fuzzer: &mut Z,
+        executor: &mut E,
+        manager: &mut EM,
+        in_dirs: &[PathBuf],
+    ) -> Result<(), Error>
+    where
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
+    {
+        self.canonicalize_input_dirs(in_dirs)?;
+        self.continue_loading_initial_inputs_custom(
+            fuzzer,
+            executor,
+            manager,
+            LoadConfig {
+                loader: &mut |_, _, path| I::from_file(path),
+                forced: false,
+                exit_on_solution: true,
+            },
+        )
+    }
+
+    fn calculate_corpus_size(&mut self) -> Result<usize, Error> {
+        let mut count: usize = 0;
+        loop {
+            match self.next_file() {
+                Ok(_) => {
+                    count = count.saturating_add(1);
+                }
+                Err(Error::IteratorEnd(_, _)) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(count)
+    }
+    /// Loads initial inputs by dividing the from the passed-in `in_dirs`
+    /// in a multicore fashion. Divides the corpus in chunks spread across cores.
+    pub fn load_initial_inputs_multicore<E, EM, Z>(
+        &mut self,
+        fuzzer: &mut Z,
+        executor: &mut E,
+        manager: &mut EM,
+        in_dirs: &[PathBuf],
+        core_id: &CoreId,
+        cores: &Cores,
+    ) -> Result<(), Error>
+    where
+        EM: EventFirer<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
+    {
+        if self.multicore_inputs_processed.unwrap_or(false) {
+            self.continue_loading_initial_inputs_custom(
+                fuzzer,
+                executor,
+                manager,
+                LoadConfig {
+                    loader: &mut |_, _, path| I::from_file(path),
+                    forced: false,
+                    exit_on_solution: false,
+                },
+            )?;
+        } else {
+            self.canonicalize_input_dirs(in_dirs)?;
+            let corpus_size = self.calculate_corpus_size()?;
+            log::info!(
+                "{} total_corpus_size, {} cores",
+                corpus_size,
+                cores.ids.len()
+            );
+            self.reset_initial_files_state();
+            self.canonicalize_input_dirs(in_dirs)?;
+            if cores.ids.len() > corpus_size {
+                log::info!(
+                    "low intial corpus count ({}), no parallelism required.",
+                    corpus_size
+                );
+            } else {
+                let core_index = cores
+                    .ids
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| *c == core_id)
+                    .unwrap_or_else(|| panic!("core id {} not in cores list", core_id.0))
+                    .0;
+                let chunk_size = corpus_size.saturating_div(cores.ids.len());
+                let mut skip = core_index.saturating_mul(chunk_size);
+                let mut inputs_todo = chunk_size;
+                let mut collected_inputs = Vec::new();
+                log::info!(
+                    "core = {}, core_index = {}, chunk_size = {}, skip = {}",
+                    core_id.0,
+                    core_index,
+                    chunk_size,
+                    skip
+                );
+                loop {
+                    match self.next_file() {
+                        Ok(path) => {
+                            if skip != 0 {
+                                skip = skip.saturating_sub(1);
+                                continue;
+                            }
+                            if inputs_todo == 0 {
+                                break;
+                            }
+                            collected_inputs.push(path);
+                            inputs_todo = inputs_todo.saturating_sub(1);
+                        }
+                        Err(Error::IteratorEnd(_, _)) => break,
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    }
+                }
+                self.remaining_initial_files = Some(collected_inputs);
+            }
+            self.multicore_inputs_processed = Some(true);
+            return self
+                .load_initial_inputs_multicore(fuzzer, executor, manager, in_dirs, core_id, cores);
+        }
+        Ok(())
     }
 }
 
-impl<C, I, R, SC> StdState<I, C, R, SC>
+impl<C, I, R, SC> StdState<C, I, R, SC>
 where
+    C: Corpus<I>,
     I: Input,
-    C: Corpus<Input = <Self as UsesInput>::Input>,
     R: Rand,
-    SC: Corpus<Input = <Self as UsesInput>::Input>,
+    SC: Corpus<I>,
 {
     fn generate_initial_internal<G, E, EM, Z>(
         &mut self,
@@ -869,10 +1016,9 @@ where
         forced: bool,
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        G: Generator<<Self as UsesInput>::Input, Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        G: Generator<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
         let mut added = 0;
         for _ in 0..num {
@@ -881,7 +1027,7 @@ where
                 let _: CorpusId = fuzzer.add_input(self, executor, manager, input)?;
                 added += 1;
             } else {
-                let (res, _) = fuzzer.evaluate_input(self, executor, manager, input)?;
+                let (res, _) = fuzzer.evaluate_input(self, executor, manager, &input)?;
                 if res != ExecuteInputResult::None {
                     added += 1;
                 }
@@ -908,10 +1054,9 @@ where
         num: usize,
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        G: Generator<<Self as UsesInput>::Input, Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        G: Generator<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
         self.generate_initial_internal(fuzzer, executor, generator, manager, num, true)
     }
@@ -926,10 +1071,9 @@ where
         num: usize,
     ) -> Result<(), Error>
     where
-        E: UsesState<State = Self>,
-        EM: EventFirer<State = Self>,
-        G: Generator<<Self as UsesInput>::Input, Self>,
-        Z: Evaluator<E, EM, State = Self>,
+        EM: EventFirer<I, Self>,
+        G: Generator<I, Self>,
+        Z: Evaluator<E, EM, I, Self>,
     {
         self.generate_initial_internal(fuzzer, executor, generator, manager, num, false)
     }
@@ -943,32 +1087,35 @@ where
         objective: &mut O,
     ) -> Result<Self, Error>
     where
-        F: Feedback<Self>,
-        O: Feedback<Self>,
+        F: StateInitializer<Self>,
+        O: StateInitializer<Self>,
+        C: Serialize + DeserializeOwned,
+        SC: Serialize + DeserializeOwned,
     {
         let mut state = Self {
             rand,
             executions: 0,
             imported: 0,
-            start_time: Duration::from_millis(0),
+            start_time: libafl_bolts::current_time(),
             metadata: SerdeAnyMap::default(),
             named_metadata: NamedSerdeAnyMap::default(),
             corpus,
             solutions,
             max_size: DEFAULT_MAX_SIZE,
+            stop_requested: false,
             #[cfg(feature = "introspection")]
-            introspection_monitor: ClientPerfMonitor::new(),
-            #[cfg(feature = "scalability_introspection")]
-            scalability_monitor: ScalabilityMonitor::new(),
+            introspection_stats: ClientPerfStats::new(),
             #[cfg(feature = "std")]
             remaining_initial_files: None,
             #[cfg(feature = "std")]
             dont_reenter: None,
             last_report_time: None,
-            corpus_idx: None,
-            stage_depth: 0,
-            stage_idx_stack: Vec::new(),
+            last_found_time: libafl_bolts::current_time(),
+            corpus_id: None,
+            stage_stack: StageStack::default(),
             phantom: PhantomData,
+            #[cfg(feature = "std")]
+            multicore_inputs_processed: None,
         };
         feedback.init_state(&mut state)?;
         objective.init_state(&mut state)?;
@@ -976,333 +1123,193 @@ where
     }
 }
 
-#[cfg(feature = "introspection")]
-impl<I, C, R, SC> HasClientPerfMonitor for StdState<I, C, R, SC> {
-    fn introspection_monitor(&self) -> &ClientPerfMonitor {
-        &self.introspection_monitor
-    }
-
-    fn introspection_monitor_mut(&mut self) -> &mut ClientPerfMonitor {
-        &mut self.introspection_monitor
-    }
-}
-
-#[cfg(feature = "scalability_introspection")]
-impl<I, C, R, SC> HasScalabilityMonitor for StdState<I, C, R, SC> {
-    fn scalability_monitor(&self) -> &ScalabilityMonitor {
-        &self.scalability_monitor
-    }
-
-    fn scalability_monitor_mut(&mut self) -> &mut ScalabilityMonitor {
-        &mut self.scalability_monitor
-    }
-}
-
-#[cfg(test)]
-pub mod test {
-    use core::{marker::PhantomData, time::Duration};
-
-    use libafl_bolts::{rands::StdRand, serdeany::SerdeAnyMap, Error};
-    use serde::{Deserialize, Serialize};
-
-    use crate::{
-        corpus::{CorpusId, HasCurrentCorpusIdx, InMemoryCorpus},
-        inputs::{Input, NopInput, UsesInput},
-        stages::test::{test_resume, test_resume_stages},
-        state::{
-            HasCurrentStage, HasExecutions, HasLastReportTime, HasMetadata, HasRand, State,
-            StdState,
-        },
-    };
-    #[cfg(feature = "introspection")]
-    use crate::{monitors::ClientPerfMonitor, state::HasClientPerfMonitor};
-    #[cfg(feature = "scalability_introspection")]
-    use crate::{monitors::ScalabilityMonitor, state::HasScalabilityMonitor};
-
-    /// A very simple state without any bells or whistles, for testing.
-    #[derive(Debug, Serialize, Deserialize, Default)]
-    pub struct NopState<I> {
-        metadata: SerdeAnyMap,
-        execution: usize,
-        rand: StdRand,
-        phantom: PhantomData<I>,
-    }
-
-    impl<I> NopState<I> {
-        /// Create a new State that does nothing (for tests)
-        #[must_use]
-        pub fn new() -> Self {
-            NopState {
-                metadata: SerdeAnyMap::new(),
-                execution: 0,
-                rand: StdRand::default(),
-                phantom: PhantomData,
-            }
-        }
-    }
-
-    impl<I> UsesInput for NopState<I>
-    where
-        I: Input,
-    {
-        type Input = I;
-    }
-
-    impl<I> HasExecutions for NopState<I> {
-        fn executions(&self) -> &usize {
-            &self.execution
-        }
-
-        fn executions_mut(&mut self) -> &mut usize {
-            &mut self.execution
-        }
-    }
-
-    impl<I> HasLastReportTime for NopState<I> {
-        fn last_report_time(&self) -> &Option<Duration> {
-            unimplemented!();
-        }
-
-        fn last_report_time_mut(&mut self) -> &mut Option<Duration> {
-            unimplemented!();
-        }
-    }
-
-    impl<I> HasMetadata for NopState<I> {
-        fn metadata_map(&self) -> &SerdeAnyMap {
-            &self.metadata
-        }
-
-        fn metadata_map_mut(&mut self) -> &mut SerdeAnyMap {
-            &mut self.metadata
-        }
-    }
-
-    impl<I> HasRand for NopState<I> {
-        type Rand = StdRand;
-
-        fn rand(&self) -> &Self::Rand {
-            &self.rand
-        }
-
-        fn rand_mut(&mut self) -> &mut Self::Rand {
-            &mut self.rand
-        }
-    }
-
-    impl<I> State for NopState<I> where I: Input {}
-
-    impl<I> HasCurrentCorpusIdx for NopState<I> {
-        fn set_corpus_idx(&mut self, _idx: CorpusId) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn clear_corpus_idx(&mut self) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn current_corpus_idx(&self) -> Result<Option<CorpusId>, Error> {
-            Ok(None)
-        }
-    }
-
-    impl<I> HasCurrentStage for NopState<I> {
-        fn set_stage(&mut self, _idx: usize) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn clear_stage(&mut self) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn current_stage(&self) -> Result<Option<usize>, Error> {
-            Ok(None)
-        }
-    }
-
-    #[cfg(feature = "introspection")]
-    impl<I> HasClientPerfMonitor for NopState<I> {
-        fn introspection_monitor(&self) -> &ClientPerfMonitor {
-            unimplemented!();
-        }
-
-        fn introspection_monitor_mut(&mut self) -> &mut ClientPerfMonitor {
-            unimplemented!();
-        }
-    }
-
-    #[cfg(feature = "scalability_introspection")]
-    impl<I> HasScalabilityMonitor for NopState<I> {
-        fn scalability_monitor(&self) -> &ScalabilityMonitor {
-            unimplemented!();
-        }
-
-        fn scalability_monitor_mut(&mut self) -> &mut ScalabilityMonitor {
-            unimplemented!();
-        }
-    }
-
-    #[must_use]
-    pub fn test_std_state<I: Input>() -> StdState<I, InMemoryCorpus<I>, StdRand, InMemoryCorpus<I>>
-    {
+impl StdState<InMemoryCorpus<NopInput>, NopInput, StdRand, InMemoryCorpus<NopInput>> {
+    /// Create an empty [`StdState`] that has very minimal uses.
+    /// Potentially good for testing.
+    pub fn nop() -> Result<
+        StdState<InMemoryCorpus<NopInput>, NopInput, StdRand, InMemoryCorpus<NopInput>>,
+        Error,
+    > {
         StdState::new(
             StdRand::with_seed(0),
-            InMemoryCorpus::<I>::new(),
+            InMemoryCorpus::<NopInput>::new(),
             InMemoryCorpus::new(),
             &mut (),
             &mut (),
         )
-        .expect("couldn't instantiate the test state")
-    }
-
-    #[test]
-    fn resume_simple() {
-        let mut state = test_std_state::<NopInput>();
-        let (completed, stages) = test_resume_stages();
-
-        test_resume(&completed, &mut state, stages);
     }
 }
 
-#[cfg(feature = "python")]
-#[allow(missing_docs)]
-/// `State` Python bindings
-pub mod pybind {
-    use alloc::{boxed::Box, vec::Vec};
-    use std::path::PathBuf;
-
-    use libafl_bolts::{ownedref::OwnedMutPtr, rands::pybind::PythonRand};
-    use pyo3::{prelude::*, types::PyDict};
-
-    use crate::{
-        corpus::pybind::PythonCorpus,
-        events::pybind::PythonEventManager,
-        executors::pybind::PythonExecutor,
-        feedbacks::pybind::PythonFeedback,
-        fuzzer::pybind::PythonStdFuzzerWrapper,
-        generators::pybind::PythonGenerator,
-        inputs::BytesInput,
-        pybind::PythonMetadata,
-        state::{
-            HasCorpus, HasExecutions, HasMaxSize, HasMetadata, HasRand, HasSolutions, StdState,
-        },
-    };
-
-    /// `StdState` with fixed generics
-    pub type PythonStdState = StdState<BytesInput, PythonCorpus, PythonRand, PythonCorpus>;
-
-    #[pyclass(unsendable, name = "StdState")]
-    #[derive(Debug)]
-    /// Python class for StdState
-    pub struct PythonStdStateWrapper {
-        /// Rust wrapped StdState object
-        pub inner: OwnedMutPtr<PythonStdState>,
+#[cfg(feature = "introspection")]
+impl<C, I, R, SC> HasClientPerfMonitor for StdState<C, I, R, SC> {
+    fn introspection_stats(&self) -> &ClientPerfStats {
+        &self.introspection_stats
     }
 
-    impl PythonStdStateWrapper {
-        pub fn wrap(r: &mut PythonStdState) -> Self {
-            Self {
-                inner: OwnedMutPtr::Ptr(r),
-            }
-        }
+    fn introspection_stats_mut(&mut self) -> &mut ClientPerfStats {
+        &mut self.introspection_stats
+    }
+}
 
-        #[must_use]
-        pub fn unwrap(&self) -> &PythonStdState {
-            self.inner.as_ref()
-        }
+/// A very simple state without any bells or whistles, for testing.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct NopState<I> {
+    metadata: SerdeAnyMap,
+    named_metadata: NamedSerdeAnyMap,
+    execution: u64,
+    stop_requested: bool,
+    rand: StdRand,
+    phantom: PhantomData<I>,
+}
 
-        pub fn unwrap_mut(&mut self) -> &mut PythonStdState {
-            self.inner.as_mut()
+impl<I> NopState<I> {
+    /// Create a new State that does nothing (for tests)
+    #[must_use]
+    pub fn new() -> Self {
+        NopState {
+            metadata: SerdeAnyMap::new(),
+            named_metadata: NamedSerdeAnyMap::new(),
+            execution: 0,
+            rand: StdRand::default(),
+            stop_requested: false,
+            phantom: PhantomData,
         }
     }
+}
 
-    #[pymethods]
-    impl PythonStdStateWrapper {
-        #[new]
-        fn new(
-            py_rand: PythonRand,
-            corpus: PythonCorpus,
-            solutions: PythonCorpus,
-            feedback: &mut PythonFeedback,
-            objective: &mut PythonFeedback,
-        ) -> Self {
-            Self {
-                inner: OwnedMutPtr::Owned(Box::new(
-                    StdState::new(py_rand, corpus, solutions, feedback, objective)
-                        .expect("Failed to create a new StdState"),
-                )),
-            }
-        }
-
-        fn metadata(&mut self) -> PyObject {
-            let meta = self.inner.as_mut().metadata_map_mut();
-            if !meta.contains::<PythonMetadata>() {
-                Python::with_gil(|py| {
-                    let dict: Py<PyDict> = PyDict::new(py).into();
-                    meta.insert(PythonMetadata::new(dict.to_object(py)));
-                });
-            }
-            meta.get::<PythonMetadata>().unwrap().map.clone()
-        }
-
-        fn rand(&self) -> PythonRand {
-            self.inner.as_ref().rand().clone()
-        }
-
-        fn corpus(&self) -> PythonCorpus {
-            self.inner.as_ref().corpus().clone()
-        }
-
-        fn solutions(&self) -> PythonCorpus {
-            self.inner.as_ref().solutions().clone()
-        }
-
-        fn executions(&self) -> usize {
-            *self.inner.as_ref().executions()
-        }
-
-        fn max_size(&self) -> usize {
-            self.inner.as_ref().max_size()
-        }
-
-        fn generate_initial_inputs(
-            &mut self,
-            py_fuzzer: &mut PythonStdFuzzerWrapper,
-            py_executor: &mut PythonExecutor,
-            py_generator: &mut PythonGenerator,
-            py_mgr: &mut PythonEventManager,
-            num: usize,
-        ) {
-            self.inner
-                .as_mut()
-                .generate_initial_inputs(
-                    py_fuzzer.unwrap_mut(),
-                    py_executor,
-                    py_generator,
-                    py_mgr,
-                    num,
-                )
-                .expect("Failed to generate the initial corpus");
-        }
-
-        #[allow(clippy::needless_pass_by_value)]
-        fn load_initial_inputs(
-            &mut self,
-            py_fuzzer: &mut PythonStdFuzzerWrapper,
-            py_executor: &mut PythonExecutor,
-            py_mgr: &mut PythonEventManager,
-            in_dirs: Vec<PathBuf>,
-        ) {
-            self.inner
-                .as_mut()
-                .load_initial_inputs(py_fuzzer.unwrap_mut(), py_executor, py_mgr, &in_dirs)
-                .expect("Failed to load the initial corpus");
-        }
+impl<I> HasMaxSize for NopState<I> {
+    fn max_size(&self) -> usize {
+        16_384
     }
 
-    /// Register the classes to the python module
-    pub fn register(_py: Python, m: &PyModule) -> PyResult<()> {
-        m.add_class::<PythonStdStateWrapper>()?;
+    fn set_max_size(&mut self, _max_size: usize) {
+        unimplemented!("NopState doesn't allow setting a max size")
+    }
+}
+
+impl<I> HasCorpus<I> for NopState<I> {
+    type Corpus = InMemoryCorpus<I>;
+
+    fn corpus(&self) -> &Self::Corpus {
+        unimplemented!("Unimplemented for NopState!");
+    }
+
+    fn corpus_mut(&mut self) -> &mut Self::Corpus {
+        unimplemented!("Unimplemented for No[State!");
+    }
+}
+
+impl<I> HasExecutions for NopState<I> {
+    fn executions(&self) -> &u64 {
+        &self.execution
+    }
+
+    fn executions_mut(&mut self) -> &mut u64 {
+        &mut self.execution
+    }
+}
+
+impl<I> Stoppable for NopState<I> {
+    fn request_stop(&mut self) {
+        self.stop_requested = true;
+    }
+
+    fn discard_stop_request(&mut self) {
+        self.stop_requested = false;
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+}
+
+impl<I> HasLastReportTime for NopState<I> {
+    fn last_report_time(&self) -> &Option<Duration> {
+        unimplemented!();
+    }
+
+    fn last_report_time_mut(&mut self) -> &mut Option<Duration> {
+        unimplemented!();
+    }
+}
+
+impl<I> HasMetadata for NopState<I> {
+    fn metadata_map(&self) -> &SerdeAnyMap {
+        &self.metadata
+    }
+
+    fn metadata_map_mut(&mut self) -> &mut SerdeAnyMap {
+        &mut self.metadata
+    }
+}
+
+impl<I> HasNamedMetadata for NopState<I> {
+    fn named_metadata_map(&self) -> &NamedSerdeAnyMap {
+        &self.named_metadata
+    }
+
+    fn named_metadata_map_mut(&mut self) -> &mut NamedSerdeAnyMap {
+        &mut self.named_metadata
+    }
+}
+
+impl<I> HasRand for NopState<I> {
+    type Rand = StdRand;
+
+    fn rand(&self) -> &Self::Rand {
+        &self.rand
+    }
+
+    fn rand_mut(&mut self) -> &mut Self::Rand {
+        &mut self.rand
+    }
+}
+
+impl<I> HasCurrentCorpusId for NopState<I> {
+    fn set_corpus_id(&mut self, _id: CorpusId) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn clear_corpus_id(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn current_corpus_id(&self) -> Result<Option<CorpusId>, Error> {
+        Ok(None)
+    }
+}
+
+impl<I> HasCurrentStageId for NopState<I> {
+    fn set_current_stage_id(&mut self, _idx: StageId) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn clear_stage_id(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn current_stage_id(&self) -> Result<Option<StageId>, Error> {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "introspection")]
+impl<I> HasClientPerfMonitor for NopState<I> {
+    fn introspection_stats(&self) -> &ClientPerfStats {
+        unimplemented!();
+    }
+
+    fn introspection_stats_mut(&mut self) -> &mut ClientPerfStats {
+        unimplemented!();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::state::StdState;
+
+    #[test]
+    fn test_std_state() {
+        StdState::nop().expect("couldn't instantiate the test state");
     }
 }

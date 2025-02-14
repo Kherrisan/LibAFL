@@ -1,13 +1,11 @@
+use alloc::borrow::Cow;
 use core::{ffi::c_void, fmt::Debug};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use libafl::{
-    events::EventFirer,
     executors::ExitKind,
-    feedbacks::Feedback,
-    inputs::UsesInput,
-    observers::{Observer, ObserversTuple},
-    state::State,
+    feedbacks::{Feedback, StateInitializer},
+    observers::Observer,
     Error,
 };
 use libafl_bolts::Named;
@@ -68,7 +66,7 @@ pub unsafe extern "C" fn __sanitizer_free_hook(ptr: *const c_void) {
     }
 }
 
-const OOM_OBS_NAME: &str = "libfuzzer-like-oom";
+static OOM_OBS_NAME: Cow<'static, str> = Cow::Borrowed("libfuzzer-like-oom");
 
 /// Observer which detects if the target would run out of memory or otherwise violate the permissible usage of malloc
 #[derive(Debug, Serialize, Deserialize)]
@@ -88,16 +86,13 @@ impl OomObserver {
 
 impl Named for OomObserver {
     // strictly one name to prevent two from being registered
-    fn name(&self) -> &str {
-        OOM_OBS_NAME
+    fn name(&self) -> &Cow<'static, str> {
+        &OOM_OBS_NAME
     }
 }
 
-impl<S> Observer<S> for OomObserver
-where
-    S: UsesInput,
-{
-    fn pre_exec(&mut self, _state: &mut S, _input: &S::Input) -> Result<(), Error> {
+impl<I, S> Observer<I, S> for OomObserver {
+    fn pre_exec(&mut self, _state: &mut S, _input: &I) -> Result<(), Error> {
         OOMED.store(false, Ordering::Relaxed);
         // must reset for platforms which do not offer malloc tracking
         MALLOC_SIZE.store(0, Ordering::Relaxed);
@@ -108,7 +103,7 @@ where
     fn post_exec(
         &mut self,
         _state: &mut S,
-        _input: &S::Input,
+        _input: &I,
         _exit_kind: &ExitKind,
     ) -> Result<(), Error> {
         RUNNING.store(false, Ordering::Relaxed);
@@ -116,14 +111,14 @@ where
         Ok(())
     }
 
-    fn pre_exec_child(&mut self, state: &mut S, input: &S::Input) -> Result<(), Error> {
+    fn pre_exec_child(&mut self, state: &mut S, input: &I) -> Result<(), Error> {
         self.pre_exec(state, input)
     }
 
     fn post_exec_child(
         &mut self,
         state: &mut S,
-        input: &S::Input,
+        input: &I,
         exit_kind: &ExitKind,
     ) -> Result<(), Error> {
         self.post_exec(state, input, exit_kind)
@@ -142,27 +137,28 @@ impl OomFeedback {
 }
 
 impl Named for OomFeedback {
-    fn name(&self) -> &str {
-        "oom"
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("oom");
+        &NAME
     }
 }
 
-impl<S> Feedback<S> for OomFeedback
-where
-    S: State,
-{
-    fn is_interesting<EM, OT>(
+impl<S> StateInitializer<S> for OomFeedback {}
+
+impl<EM, I, OT, S> Feedback<EM, I, OT, S> for OomFeedback {
+    fn is_interesting(
         &mut self,
         _state: &mut S,
         _manager: &mut EM,
-        _input: &S::Input,
+        _input: &I,
         _observers: &OT,
         _exit_kind: &ExitKind,
-    ) -> Result<bool, Error>
-    where
-        EM: EventFirer<State = S>,
-        OT: ObserversTuple<S>,
-    {
+    ) -> Result<bool, Error> {
+        Ok(Self::oomed())
+    }
+
+    #[cfg(feature = "track_hit_feedbacks")]
+    fn last_result(&self) -> Result<bool, Error> {
         Ok(Self::oomed())
     }
 }

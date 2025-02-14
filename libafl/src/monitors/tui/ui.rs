@@ -1,3 +1,4 @@
+//! The UI-specific parts of [`super::TuiMonitor`]
 use alloc::{string::ToString, vec::Vec};
 use std::{
     cmp::{max, min},
@@ -5,7 +6,6 @@ use std::{
 };
 
 use ratatui::{
-    backend::Backend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
@@ -22,7 +22,7 @@ use super::{
 };
 
 #[derive(Default, Debug)]
-pub struct TuiUI {
+pub struct TuiUi {
     title: String,
     version: String,
     enhanced_graphics: bool,
@@ -35,13 +35,13 @@ pub struct TuiUI {
     pub should_quit: bool,
 }
 
-impl TuiUI {
+impl TuiUi {
     #[must_use]
     pub fn new(title: String, enhanced_graphics: bool) -> Self {
         Self::with_version(title, String::from("default"), enhanced_graphics)
     }
 
-    // create the TuiUI with a given `version`.
+    // create the TuiUi with a given `version`.
     #[must_use]
     pub fn with_version(title: String, version: String, enhanced_graphics: bool) -> Self {
         Self {
@@ -50,7 +50,7 @@ impl TuiUI {
             enhanced_graphics,
             show_logs: true,
             clients_idx: 1,
-            ..TuiUI::default()
+            ..TuiUi::default()
         }
     }
     pub fn on_key(&mut self, c: char) {
@@ -94,10 +94,8 @@ impl TuiUI {
         }
     }
 
-    pub fn draw<B>(&mut self, f: &mut Frame<B>, app: &Arc<RwLock<TuiContext>>)
-    where
-        B: Backend,
-    {
+    /// Draw the current TUI context
+    pub fn draw(&mut self, f: &mut Frame, app: &Arc<RwLock<TuiContext>>) {
         self.clients = app.read().unwrap().clients_num;
 
         let body = Layout::default()
@@ -111,8 +109,8 @@ impl TuiUI {
                     .as_ref()
                 } else {
                     [
-                        Constraint::Percentage(41),
-                        Constraint::Percentage(27),
+                        Constraint::Percentage(20),
+                        Constraint::Percentage(48),
                         Constraint::Percentage(32),
                     ]
                     .as_ref()
@@ -120,7 +118,7 @@ impl TuiUI {
             } else {
                 [Constraint::Percentage(50), Constraint::Percentage(50)].as_ref()
             })
-            .split(f.size());
+            .split(f.area());
         let top_body = body[0];
         let mid_body = body[1];
 
@@ -133,11 +131,8 @@ impl TuiUI {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn draw_overall_ui<B>(&mut self, f: &mut Frame<B>, app: &Arc<RwLock<TuiContext>>, area: Rect)
-    where
-        B: Backend,
-    {
+    #[expect(clippy::too_many_lines)]
+    fn draw_overall_ui(&mut self, f: &mut Frame, app: &Arc<RwLock<TuiContext>>, area: Rect) {
         let top_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(16), Constraint::Min(0)].as_ref())
@@ -155,8 +150,7 @@ impl TuiUI {
             .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
             .split(left_top_layout[0]);
 
-        let mut status_bar: String = self.title.clone();
-        status_bar = status_bar + " (" + self.version.as_str() + ")";
+        let status_bar: String = format!("{} ({})", self.title, self.version.as_str());
 
         let text = vec![Line::from(Span::styled(
             &status_bar,
@@ -252,10 +246,7 @@ impl TuiUI {
         self.draw_overall_generic_text(f, app, bottom_layout);
     }
 
-    fn draw_client_ui<B>(&mut self, f: &mut Frame<B>, app: &Arc<RwLock<TuiContext>>, area: Rect)
-    where
-        B: Backend,
-    {
+    fn draw_client_ui(&mut self, f: &mut Frame, app: &Arc<RwLock<TuiContext>>, area: Rect) {
         let client_block = Block::default()
             .title(Span::styled(
                 format!("client #{} (l/r arrows to switch)", self.clients_idx),
@@ -264,16 +255,20 @@ impl TuiUI {
                     .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL);
-        let client_area = client_block.inner(area);
+
+        #[allow(unused_mut)] // cfg dependent
+        let mut client_area = client_block.inner(area);
         f.render_widget(client_block, area);
 
         #[cfg(feature = "introspection")]
         {
-            let introspection_layout = Layout::default()
+            let client_layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(11), Constraint::Min(0)].as_ref())
-                .split(client_area)[1];
-            self.draw_introspection_text(f, app, introspection_layout);
+                .constraints([Constraint::Min(11), Constraint::Percentage(50)].as_ref())
+                .split(client_area);
+            client_area = client_layout[0];
+            let instrospection_layout = client_layout[1];
+            self.draw_introspection_text(f, app, instrospection_layout);
         }
 
         let left_layout = Layout::default()
@@ -284,7 +279,7 @@ impl TuiUI {
 
         let left_top_layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(6), Constraint::Length(0)].as_ref())
+            .constraints([Constraint::Length(6), Constraint::Length(5)].as_ref())
             .split(left_layout[0]);
         let left_bottom_layout = left_top_layout[1];
         self.draw_process_timing_text(f, app, left_top_layout[0], false);
@@ -292,24 +287,22 @@ impl TuiUI {
 
         let right_top_layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Length(0)].as_ref())
+            .constraints([Constraint::Length(7), Constraint::Length(5)].as_ref())
             .split(right_layout);
         let right_bottom_layout = right_top_layout[1];
         self.draw_item_geometry_text(f, app, right_top_layout[0], false);
         self.draw_client_results_text(f, app, right_bottom_layout);
     }
 
-    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-    fn draw_time_chart<B>(
+    #[expect(clippy::too_many_lines, clippy::cast_precision_loss)]
+    fn draw_time_chart(
         &mut self,
         title: &str,
         y_name: &str,
-        f: &mut Frame<B>,
+        f: &mut Frame,
         area: Rect,
         stats: &TimedStats,
-    ) where
-        B: Backend,
-    {
+    ) {
         if stats.series.is_empty() {
             return;
         }
@@ -426,27 +419,29 @@ impl TuiUI {
         f.render_widget(chart, area);
     }
 
-    fn draw_item_geometry_text<B>(
+    fn draw_item_geometry_text(
         &mut self,
-        f: &mut Frame<B>,
+        f: &mut Frame,
         app: &Arc<RwLock<TuiContext>>,
         area: Rect,
         is_overall: bool,
-    ) where
-        B: Backend,
-    {
-        let item_geometry: ItemGeometry = if is_overall {
-            app.read().unwrap().total_item_geometry.clone()
+    ) {
+        let tui_context = app.read().unwrap();
+        let empty_geometry: ItemGeometry = ItemGeometry::new();
+        let item_geometry: &ItemGeometry = if is_overall {
+            &tui_context.total_item_geometry
         } else if self.clients < 2 {
-            ItemGeometry::new()
+            &empty_geometry
         } else {
-            app.read()
-                .unwrap()
-                .clients
-                .get(&self.clients_idx)
-                .unwrap()
-                .item_geometry
-                .clone()
+            let clients = &tui_context.clients;
+            let client = clients.get(&self.clients_idx);
+            let client = client.as_ref();
+            if let Some(client) = client {
+                &client.item_geometry
+            } else {
+                log::warn!("Client {} was `None`. Race condition?", &self.clients_idx);
+                &empty_geometry
+            }
         };
 
         let items = vec![
@@ -468,7 +463,10 @@ impl TuiUI {
             ]),
             Row::new(vec![
                 Cell::from(Span::raw("stability")),
-                Cell::from(Span::raw(item_geometry.stability)),
+                Cell::from(Span::raw(format!(
+                    "{:.2}%",
+                    item_geometry.stability.unwrap_or(0.0) * 100.0
+                ))),
             ]),
         ];
 
@@ -482,7 +480,8 @@ impl TuiUI {
             )
             .split(area);
 
-        let table = Table::new(items)
+        let table = Table::default()
+            .rows(items)
             .block(
                 Block::default()
                     .title(Span::styled(
@@ -493,39 +492,36 @@ impl TuiUI {
                     ))
                     .borders(Borders::ALL),
             )
-            .widths(&[Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
+            .widths([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
         f.render_widget(table, chunks[0]);
     }
 
-    fn draw_process_timing_text<B>(
+    fn draw_process_timing_text(
         &mut self,
-        f: &mut Frame<B>,
+        f: &mut Frame,
         app: &Arc<RwLock<TuiContext>>,
         area: Rect,
         is_overall: bool,
-    ) where
-        B: Backend,
-    {
-        let tup: (Duration, ProcessTiming) = if is_overall {
-            let tui_context = app.read().unwrap();
-            (
-                tui_context.start_time,
-                tui_context.total_process_timing.clone(),
-            )
+    ) {
+        let tui_context = app.read().unwrap();
+        let empty_timing: ProcessTiming = ProcessTiming::new();
+        let tup: (Duration, &ProcessTiming) = if is_overall {
+            (tui_context.start_time, &tui_context.total_process_timing)
         } else if self.clients < 2 {
-            (current_time(), ProcessTiming::new())
+            (current_time(), &empty_timing)
         } else {
-            let client = app
-                .read()
-                .unwrap()
-                .clients
-                .get(&self.clients_idx)
-                .unwrap()
-                .clone();
-            (
-                client.process_timing.client_start_time,
-                client.process_timing,
-            )
+            let clients = &tui_context.clients;
+            let client = clients.get(&self.clients_idx);
+            let client = client.as_ref();
+            if let Some(client) = client {
+                (
+                    client.process_timing.client_start_time,
+                    &client.process_timing,
+                )
+            } else {
+                log::warn!("Client {} was `None`. Race condition?", &self.clients_idx);
+                (current_time(), &empty_timing)
+            }
         };
         let items = vec![
             Row::new(vec![
@@ -534,7 +530,7 @@ impl TuiUI {
             ]),
             Row::new(vec![
                 Cell::from(Span::raw("exec speed")),
-                Cell::from(Span::raw(tup.1.exec_speed)),
+                Cell::from(Span::raw(&tup.1.exec_speed)),
             ]),
             Row::new(vec![
                 Cell::from(Span::raw("last new entry")),
@@ -556,7 +552,8 @@ impl TuiUI {
             )
             .split(area);
 
-        let table = Table::new(items)
+        let table = Table::default()
+            .rows(items)
             .block(
                 Block::default()
                     .title(Span::styled(
@@ -567,18 +564,16 @@ impl TuiUI {
                     ))
                     .borders(Borders::ALL),
             )
-            .widths(&[Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
+            .widths([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
         f.render_widget(table, chunks[0]);
     }
 
-    fn draw_overall_generic_text<B>(
+    fn draw_overall_generic_text(
         &mut self,
-        f: &mut Frame<B>,
+        f: &mut Frame,
         app: &Arc<RwLock<TuiContext>>,
         area: Rect,
-    ) where
-        B: Backend,
-    {
+    ) {
         let items = {
             let app = app.read().unwrap();
             vec![
@@ -605,7 +600,8 @@ impl TuiUI {
             .constraints([Constraint::Percentage(100)].as_ref())
             .split(area);
 
-        let table = Table::new(items)
+        let table = Table::default()
+            .rows(items)
             .block(
                 Block::default()
                     .title(Span::styled(
@@ -616,7 +612,7 @@ impl TuiUI {
                     ))
                     .borders(Borders::ALL),
             )
-            .widths(&[
+            .widths([
                 Constraint::Percentage(15),
                 Constraint::Percentage(16),
                 Constraint::Percentage(15),
@@ -627,14 +623,12 @@ impl TuiUI {
         f.render_widget(table, chunks[0]);
     }
 
-    fn draw_client_results_text<B>(
+    fn draw_client_results_text(
         &mut self,
-        f: &mut Frame<B>,
+        f: &mut Frame,
         app: &Arc<RwLock<TuiContext>>,
         area: Rect,
-    ) where
-        B: Backend,
-    {
+    ) {
         let items = {
             let app = app.read().unwrap();
             vec![
@@ -659,11 +653,8 @@ impl TuiUI {
             ]
         };
 
-        let chunks = Layout::default()
-            .constraints([Constraint::Percentage(100)].as_ref())
-            .split(area);
-
-        let table = Table::new(items)
+        let table = Table::default()
+            .rows(items)
             .block(
                 Block::default()
                     .title(Span::styled(
@@ -674,18 +665,16 @@ impl TuiUI {
                     ))
                     .borders(Borders::ALL),
             )
-            .widths(&[Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
-        f.render_widget(table, chunks[0]);
+            .widths([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
+        f.render_widget(table, area);
     }
 
-    fn draw_client_generic_text<B>(
+    fn draw_client_generic_text(
         &mut self,
-        f: &mut Frame<B>,
+        f: &mut Frame,
         app: &Arc<RwLock<TuiContext>>,
         area: Rect,
-    ) where
-        B: Backend,
-    {
+    ) {
         let items = {
             let app = app.read().unwrap();
             vec![
@@ -716,11 +705,8 @@ impl TuiUI {
             ]
         };
 
-        let chunks = Layout::default()
-            .constraints([Constraint::Percentage(100)].as_ref())
-            .split(area);
-
-        let table = Table::new(items)
+        let table = Table::default()
+            .rows(items)
             .block(
                 Block::default()
                     .title(Span::styled(
@@ -731,19 +717,17 @@ impl TuiUI {
                     ))
                     .borders(Borders::ALL),
             )
-            .widths(&[Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
-        f.render_widget(table, chunks[0]);
+            .widths([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
+        f.render_widget(table, area);
     }
 
     #[cfg(feature = "introspection")]
-    fn draw_introspection_text<B>(
+    fn draw_introspection_text(
         &mut self,
-        f: &mut Frame<B>,
+        f: &mut Frame,
         app: &Arc<RwLock<TuiContext>>,
         area: Rect,
-    ) where
-        B: Backend,
-    {
+    ) {
         let mut items = vec![];
         {
             let ctx = app.read().unwrap();
@@ -779,10 +763,11 @@ impl TuiUI {
                     Cell::from(Span::raw("not measured")),
                     Cell::from(Span::raw(format!("{:.2}%", client.unmeasured * 100.0))),
                 ]));
-            };
+            }
         }
 
-        let table = Table::new(items)
+        let table = Table::default()
+            .rows(items)
             .block(
                 Block::default()
                     .title(Span::styled(
@@ -793,14 +778,11 @@ impl TuiUI {
                     ))
                     .borders(Borders::ALL),
             )
-            .widths(&[Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
+            .widths([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]);
         f.render_widget(table, area);
     }
-    #[allow(clippy::unused_self)]
-    fn draw_logs<B>(&mut self, f: &mut Frame<B>, app: &Arc<RwLock<TuiContext>>, area: Rect)
-    where
-        B: Backend,
-    {
+    #[expect(clippy::unused_self)]
+    fn draw_logs(&mut self, f: &mut Frame, app: &Arc<RwLock<TuiContext>>, area: Rect) {
         let app = app.read().unwrap();
         let logs: Vec<ListItem> = app
             .client_logs

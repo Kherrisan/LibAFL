@@ -12,11 +12,11 @@ use alloc::{
 use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
 
-use crate::inputs::Input;
+use crate::{corpus::CorpusId, inputs::Input};
 
 /// An input composed of multiple parts. Use in situations where subcomponents are not necessarily
 /// related, or represent distinct parts of the input.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Hash)]
 pub struct MultipartInput<I> {
     parts: Vec<I>,
     names: Vec<String>,
@@ -153,13 +153,17 @@ impl<I> Input for MultipartInput<I>
 where
     I: Input,
 {
-    fn generate_name(&self, idx: usize) -> String {
-        self.names
-            .iter()
-            .cloned()
-            .zip(self.parts.iter().map(|i| i.generate_name(idx)))
-            .map(|(name, generated)| format!("{name}-{generated}"))
-            .collect::<Vec<_>>()
-            .join(",")
+    fn generate_name(&self, id: Option<CorpusId>) -> String {
+        if self.names().is_empty() {
+            "empty_multipart_input".to_string() // empty strings cause issues with OnDiskCorpus
+        } else {
+            self.names
+                .iter()
+                .cloned()
+                .zip(self.parts.iter().map(|i| i.generate_name(id)))
+                .map(|(name, generated)| format!("{name}-{generated}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
     }
 }

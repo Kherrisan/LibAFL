@@ -3,7 +3,6 @@ extern crate libafl;
 extern crate libafl_bolts;
 
 use std::path::PathBuf;
-
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
@@ -15,7 +14,7 @@ use libafl::{
     schedulers::QueueScheduler,
     state::StdState,
 };
-use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};
+use libafl_bolts::{rands::StdRand, tuples::tuple_list, AsSlice, nonzero};
 /* ANCHOR_END: use */
 
 fn main() {
@@ -40,7 +39,7 @@ fn main() {
     // create a State from scratch
     let mut state = StdState::new(
         // RNG
-        StdRand::with_seed(current_nanos()),
+        StdRand::new(),
         // Corpus that will be evolved, we keep it in memory for performance
         InMemoryCorpus::new(),
         // Corpus in which we store solutions (crashes in this example),
@@ -71,19 +70,13 @@ fn main() {
 
     /* ANCHOR: executor */
     // Create the executor for an in-process function
-    let mut executor = InProcessExecutor::new(
-        &mut harness,
-        (),
-        &mut fuzzer,
-        &mut state,
-        &mut mgr,
-    )
-    .expect("Failed to create the Executor");
+    let mut executor = InProcessExecutor::new(&mut harness, (), &mut fuzzer, &mut state, &mut mgr)
+        .expect("Failed to create the Executor");
     /* ANCHOR_END: executor */
 
     /* ANCHOR: generator */
     // Generator of printable bytearrays of max size 32
-    let mut generator = RandPrintablesGenerator::new(32);
+    let mut generator = RandPrintablesGenerator::new(nonzero!(32));
 
     // Generate 8 initial inputs
     state

@@ -6,10 +6,14 @@ use alloc::{
 use core::fmt::Debug;
 use std::{fs, io::BufReader, path::Path};
 
-use grammartec::context::Context;
-pub use grammartec::newtypes::NTermID;
+use libafl_bolts::rands::Rand;
 
-use crate::{generators::Generator, inputs::nautilus::NautilusInput, Error};
+pub use crate::common::nautilus::grammartec::newtypes::NTermId;
+use crate::{
+    common::nautilus::grammartec::context::Context, generators::Generator,
+    inputs::nautilus::NautilusInput, nautilus::grammartec::python_grammar_loader, state::HasRand,
+    Error,
+};
 
 /// The nautilus context for a generator
 pub struct NautilusContext {
@@ -81,13 +85,25 @@ impl NautilusContext {
     }
 
     /// Create a new [`NautilusContext`] from a file
-    #[must_use]
-    pub fn from_file<P: AsRef<Path>>(tree_depth: usize, grammar_file: P) -> Self {
-        let file = fs::File::open(grammar_file).expect("Cannot open grammar file");
+    pub fn from_file<P: AsRef<Path>>(tree_depth: usize, grammar_file: P) -> Result<Self, Error> {
+        let grammar_file = grammar_file.as_ref();
+        if grammar_file.extension().unwrap_or_default() == "py" {
+            log::debug!("Creating NautilusContext from python grammar");
+            let mut ctx = python_grammar_loader::load_python_grammar(
+                fs::read_to_string(grammar_file)?.as_str(),
+            );
+            ctx.initialize(tree_depth);
+            return Ok(Self { ctx });
+        }
+        log::debug!("Creating NautilusContext from json grammar");
+        let file = fs::File::open(grammar_file)?;
         let reader = BufReader::new(file);
-        let rules: Vec<Vec<String>> =
-            serde_json::from_reader(reader).expect("Cannot parse grammar file");
-        Self::new(tree_depth, &rules)
+        let rules: Vec<Vec<String>> = serde_json::from_reader(reader).map_err(|err| {
+            Error::illegal_argument(format!(
+                "Error loading context from json grammar file {grammar_file:?}: {err:?}"
+            ))
+        })?;
+        Ok(Self::new(tree_depth, &rules))
     }
 }
 
@@ -104,12 +120,12 @@ impl Debug for NautilusGenerator<'_> {
     }
 }
 
-impl<'a, S> Generator<NautilusInput, S> for NautilusGenerator<'a> {
-    fn generate(&mut self, _state: &mut S) -> Result<NautilusInput, Error> {
+impl<S: HasRand> Generator<NautilusInput, S> for NautilusGenerator<'_> {
+    fn generate(&mut self, state: &mut S) -> Result<NautilusInput, Error> {
         let nonterm = self.nonterminal("START");
         let len = self.ctx.get_random_len_for_nt(&nonterm);
         let mut input = NautilusInput::empty();
-        self.generate_from_nonterminal(&mut input, nonterm, len);
+        self.generate_from_nonterminal(state.rand_mut(), &mut input, nonterm, len);
         Ok(input)
     }
 }
@@ -124,12 +140,20 @@ impl<'a> NautilusGenerator<'a> {
     /// Gets the nonterminal from this input
     // TODO create from a python grammar
     #[must_use]
-    pub fn nonterminal(&self, name: &str) -> NTermID {
+    pub fn nonterminal(&self, name: &str) -> NTermId {
         self.ctx.nt_id(name)
     }
 
     /// Generates a [`NautilusInput`] from a nonterminal
-    pub fn generate_from_nonterminal(&self, input: &mut NautilusInput, start: NTermID, len: usize) {
-        input.tree_mut().generate_from_nt(start, len, self.ctx);
+    pub fn generate_from_nonterminal<R: Rand>(
+        &self,
+        rand: &mut R,
+        input: &mut NautilusInput,
+        start: NTermId,
+        len: usize,
+    ) {
+        input
+            .tree_mut()
+            .generate_from_nt(rand, start, len, self.ctx);
     }
 }

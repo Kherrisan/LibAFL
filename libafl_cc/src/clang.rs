@@ -24,14 +24,11 @@ fn dll_extension<'a>() -> &'a str {
 include!(concat!(env!("OUT_DIR"), "/clang_constants.rs"));
 
 /// The supported LLVM passes
-#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LLVMPasses {
     //CmpLogIns,
-    /// The CmpLog pass
+    /// The `CmpLog` pass
     CmpLogRtn,
-    /// The AFL coverage pass
-    AFLCoverage,
     /// The Autotoken pass
     AutoTokens,
     /// The Coverage Accouting (BB metric) pass
@@ -39,8 +36,16 @@ pub enum LLVMPasses {
     /// The dump cfg pass
     DumpCfg,
     #[cfg(unix)]
-    /// The CmpLog Instruction pass
+    /// The `CmpLog` Instruction pass
     CmpLogInstructions,
+    /// Instrument caller for sancov coverage
+    Ctx,
+    /// Function logging
+    FunctionLogging,
+    /// Profiling
+    Profiling,
+    /// Data dependency instrumentation
+    DDG,
 }
 
 impl LLVMPasses {
@@ -50,8 +55,6 @@ impl LLVMPasses {
         match self {
             LLVMPasses::CmpLogRtn => PathBuf::from(env!("OUT_DIR"))
                 .join(format!("cmplog-routines-pass.{}", dll_extension())),
-            LLVMPasses::AFLCoverage => PathBuf::from(env!("OUT_DIR"))
-                .join(format!("afl-coverage-pass.{}", dll_extension())),
             LLVMPasses::AutoTokens => {
                 PathBuf::from(env!("OUT_DIR")).join(format!("autotokens-pass.{}", dll_extension()))
             }
@@ -63,12 +66,24 @@ impl LLVMPasses {
             #[cfg(unix)]
             LLVMPasses::CmpLogInstructions => PathBuf::from(env!("OUT_DIR"))
                 .join(format!("cmplog-instructions-pass.{}", dll_extension())),
+            LLVMPasses::Ctx => {
+                PathBuf::from(env!("OUT_DIR")).join(format!("ctx-pass.{}", dll_extension()))
+            }
+            LLVMPasses::FunctionLogging => {
+                PathBuf::from(env!("OUT_DIR")).join(format!("function-logging.{}", dll_extension()))
+            }
+            LLVMPasses::Profiling => {
+                PathBuf::from(env!("OUT_DIR")).join(format!("profiling.{}", dll_extension()))
+            }
+            LLVMPasses::DDG => {
+                PathBuf::from(env!("OUT_DIR")).join(format!("ddg-instr.{}", dll_extension()))
+            }
         }
     }
 }
 
 /// Wrap Clang
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct ClangWrapper {
     is_silent: bool,
@@ -99,9 +114,9 @@ pub struct ClangWrapper {
     passes_linking_args: Vec<String>,
 }
 
-#[allow(clippy::match_same_arms)] // for the linking = false wip for "shared"
+#[expect(clippy::match_same_arms)] // for the linking = false wip for "shared"
 impl ToolWrapper for ClangWrapper {
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn parse_args<S>(&mut self, args: &[S]) -> Result<&'_ mut Self, Error>
     where
         S: AsRef<str>,
@@ -151,11 +166,11 @@ impl ToolWrapper for ClangWrapper {
         let mut suppress_linking = 0;
         let mut i = 1;
         while i < args.len() {
-            let arg_as_path = std::path::Path::new(args[i].as_ref());
+            let arg_as_path = Path::new(args[i].as_ref());
 
             if arg_as_path
                 .extension()
-                .map_or(false, |ext| ext.eq_ignore_ascii_case("s"))
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("s"))
             {
                 self.is_asm = true;
             }
@@ -230,7 +245,7 @@ impl ToolWrapper for ClangWrapper {
                     shared = true;
                 } // TODO dynamic list?
                 _ => (),
-            };
+            }
             new_args.push(args[i].as_ref().to_string());
             i += 1;
         }
@@ -272,7 +287,7 @@ impl ToolWrapper for ClangWrapper {
         if linking {
             new_args.push("-lrt".into());
         }
-        // MacOS has odd linker behavior sometimes
+        // `MacOS` has odd linker behavior sometimes
         #[cfg(target_vendor = "apple")]
         if linking || shared {
             new_args.push("-undefined".into());
@@ -310,7 +325,7 @@ impl ToolWrapper for ClangWrapper {
         self.command_for_configuration(crate::Configuration::Default)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn command_for_configuration(
         &mut self,
         configuration: crate::Configuration,
@@ -328,7 +343,7 @@ impl ToolWrapper for ClangWrapper {
             .base_args
             .iter()
             .map(|r| {
-                let arg_as_path = std::path::PathBuf::from(r);
+                let arg_as_path = PathBuf::from(r);
                 if r.ends_with('.') {
                     r.to_string()
                 } else {
@@ -365,7 +380,7 @@ impl ToolWrapper for ClangWrapper {
             // No output specified, we need to rewrite the single .c file's name into a -o
             // argument.
             for arg in &base_args {
-                let arg_as_path = std::path::PathBuf::from(arg);
+                let arg_as_path = PathBuf::from(arg);
                 if !arg.ends_with('.') && !arg.starts_with('-') {
                     if let Some(extension) = arg_as_path.extension() {
                         let extension = extension.to_str().unwrap();
@@ -375,7 +390,7 @@ impl ToolWrapper for ClangWrapper {
                                 args.push("-o".to_string());
                                 args.push(if self.linking {
                                     configuration
-                                        .replace_extension(&std::path::PathBuf::from("a.out"))
+                                        .replace_extension(&PathBuf::from("a.out"))
                                         .into_os_string()
                                         .into_string()
                                         .unwrap()

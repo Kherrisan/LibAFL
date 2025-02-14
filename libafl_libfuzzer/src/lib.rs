@@ -75,6 +75,42 @@
 //! to the runtime (e.g., to prevent coverage being collected on the runtime).
 //!
 #![cfg_attr(feature = "document-features", doc = document_features::document_features!())]
+#![cfg_attr(not(test), warn(
+    missing_debug_implementations,
+    missing_docs,
+    //trivial_casts,
+    trivial_numeric_casts,
+    unused_extern_crates,
+    unused_import_braces,
+    unused_qualifications,
+    //unused_results
+))]
+#![cfg_attr(test, deny(
+    missing_debug_implementations,
+    missing_docs,
+    //trivial_casts,
+    trivial_numeric_casts,
+    unused_extern_crates,
+    unused_import_braces,
+    unused_qualifications,
+    unused_must_use,
+    unfulfilled_lint_expectations,
+    bad_style,
+    dead_code,
+    improper_ctypes,
+    non_shorthand_field_patterns,
+    no_mangle_generic_items,
+    overflowing_literals,
+    path_statements,
+    patterns_in_fns_without_body,
+    unconditional_recursion,
+    unused,
+    unused_allocation,
+    unused_comparisons,
+    unused_parens,
+    while_true
+    )
+)]
 
 use std::ffi::{c_char, c_int};
 
@@ -97,14 +133,14 @@ extern "C" {
     target_family = "unix",
     // Disable when building with clippy, as it will complain about the missing environment
     // variable which is set by the build script, which is not run under clippy.
-    not(feature = "cargo-clippy")
+    not(clippy)
 ))]
 pub const LIBAFL_LIBFUZZER_RUNTIME_LIBRARY: &'static [u8] =
     include_bytes!(env!("LIBAFL_LIBFUZZER_RUNTIME_PATH"));
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "embed-runtime", not(feature = "cargo-clippy")))]
+    #[cfg(all(feature = "embed-runtime", not(clippy)))]
     #[test]
     fn test_embed_runtime_sized() {
         use crate::LIBAFL_LIBFUZZER_RUNTIME_LIBRARY;

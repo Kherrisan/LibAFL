@@ -10,7 +10,11 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::{mem::ManuallyDrop, ptr::addr_of};
+use core::{
+    fmt::Debug,
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+};
 #[cfg(target_vendor = "apple")]
 use std::fs;
 use std::{
@@ -18,6 +22,7 @@ use std::{
     env,
     io::{Read, Write},
     marker::PhantomData,
+    os::fd::{AsFd, BorrowedFd},
     rc::{Rc, Weak},
     sync::{Arc, Condvar, Mutex},
     thread::JoinHandle,
@@ -32,6 +37,7 @@ use std::{
 };
 
 use hashbrown::HashMap;
+use nix::poll::PollTimeout;
 #[cfg(all(feature = "std", unix))]
 use nix::poll::{poll, PollFd, PollFlags};
 use serde::{Deserialize, Serialize};
@@ -40,7 +46,7 @@ use uds::{UnixListenerExt, UnixSocketAddr, UnixStreamExt};
 
 use crate::{
     shmem::{ShMem, ShMemDescription, ShMemId, ShMemProvider},
-    AsMutSlice, AsSlice, Error,
+    Error,
 };
 
 /// The default server name for our abstract shmem server
@@ -55,10 +61,7 @@ const AFL_SHMEM_SERVICE_STARTED: &str = "AFL_SHMEM_SERVICE_STARTED";
 
 ///     s out served shared maps, as used on Android.
 #[derive(Debug)]
-pub struct ServedShMemProvider<SP>
-where
-    SP: ShMemProvider,
-{
+pub struct ServedShMemProvider<SP> {
     stream: UnixStream,
     inner: SP,
     id: i32,
@@ -71,53 +74,44 @@ where
 /// [`ShMem`] that got served from a [`ShMemService`] via domain sockets and can now be used in this program.
 /// It works around Android's lack of "proper" shared maps.
 #[derive(Clone, Debug)]
-pub struct ServedShMem<SH>
-where
-    SH: ShMem,
-{
-    inner: ManuallyDrop<SH>,
+pub struct ServedShMem<SHM> {
+    inner: ManuallyDrop<SHM>,
     server_fd: i32,
 }
 
-impl<SH> ShMem for ServedShMem<SH>
+impl<SHM> Deref for ServedShMem<SHM>
 where
-    SH: ShMem,
+    SHM: Deref<Target = [u8]>,
+{
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<SHM> DerefMut for ServedShMem<SHM>
+where
+    SHM: DerefMut<Target = [u8]>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<SHM> ShMem for ServedShMem<SHM>
+where
+    SHM: ShMem,
 {
     fn id(&self) -> ShMemId {
         let client_id = self.inner.id();
         ShMemId::from_string(&format!("{}:{client_id}", self.server_fd))
     }
-
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
 }
 
-impl<SH> AsSlice for ServedShMem<SH>
-where
-    SH: ShMem,
-{
-    type Entry = u8;
-    fn as_slice(&self) -> &[u8] {
-        self.inner.as_slice()
-    }
-}
-impl<SH> AsMutSlice for ServedShMem<SH>
-where
-    SH: ShMem,
-{
-    type Entry = u8;
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.inner.as_mut_slice()
-    }
-}
-
-impl<SP> ServedShMemProvider<SP>
-where
-    SP: ShMemProvider,
-{
+impl<SP> ServedShMemProvider<SP> {
     /// Send a request to the server, and wait for a response
-    #[allow(clippy::similar_names)] // id and fd
+    #[expect(clippy::similar_names)] // id and fd
     fn send_receive(&mut self, request: ServedShMemRequest) -> Result<(i32, i32), Error> {
         //let bt = Backtrace::new();
         //log::info!("Sending {:?} with bt:\n{:?}", request, bt);
@@ -179,7 +173,7 @@ where
     /// Connect to the server and return a new [`ServedShMemProvider`]
     /// Will try to spawn a [`ShMemService`]. This will only work for the first try.
     fn new() -> Result<Self, Error> {
-        // Needed for MacOS and Android to get sharedmaps working.
+        // Needed for `MacOS` and Android to get sharedmaps working.
         let service = ShMemService::<SP>::start();
 
         let mut res = Self {
@@ -282,24 +276,18 @@ pub enum ServedShMemRequest {
     PreFork(),
     /// The client's child re-registers with us after it forked.
     PostForkChildHello(i32),
-    /// The ShMem Service should exit. This is sually sent internally on `drop`, but feel free to do whatever with it?
+    /// The `ShMem` Service should exit. This is sually sent internally on `drop`, but feel free to do whatever with it?
     Exit,
 }
 
 /// Client side communicating with the [`ShMemServer`]
 #[derive(Debug)]
-struct SharedShMemClient<SH>
-where
-    SH: ShMem,
-{
+struct SharedShMemClient<SHM> {
     stream: UnixStream,
-    maps: HashMap<i32, Vec<Rc<RefCell<SH>>>>,
+    maps: HashMap<i32, Vec<Rc<RefCell<SHM>>>>,
 }
 
-impl<SH> SharedShMemClient<SH>
-where
-    SH: ShMem,
-{
+impl<SHM> SharedShMemClient<SHM> {
     fn new(stream: UnixStream) -> Self {
         Self {
             stream,
@@ -310,11 +298,8 @@ where
 
 /// Response from Server to Client
 #[derive(Debug)]
-enum ServedShMemResponse<SP>
-where
-    SP: ShMemProvider,
-{
-    Mapping(Rc<RefCell<SP::ShMem>>),
+enum ServedShMemResponse<SHM> {
+    Mapping(Rc<RefCell<SHM>>),
     Id(i32),
     RefCount(u32),
 }
@@ -330,22 +315,19 @@ enum ShMemServiceStatus {
 /// The [`ShMemService`] is a service handing out [`ShMem`] pages via unix domain sockets.
 /// It is mainly used and needed on Android.
 #[derive(Debug, Clone)]
-pub enum ShMemService<SP>
-where
-    SP: ShMemProvider,
-{
+pub enum ShMemService<SP> {
     /// A started service
     Started {
         /// The background thread
         bg_thread: Arc<Mutex<ShMemServiceThread>>,
-        /// The pantom data
+        /// The phantom data
         phantom: PhantomData<SP>,
     },
     /// A failed service
     Failed {
         /// The error message
         err_msg: String,
-        /// The pantom data
+        /// The phantom data
         phantom: PhantomData<SP>,
     },
 }
@@ -407,11 +389,10 @@ where
             };
         }
 
-        #[allow(clippy::mutex_atomic)]
         let syncpair = Arc::new((Mutex::new(ShMemServiceStatus::Starting), Condvar::new()));
         let childsyncpair = Arc::clone(&syncpair);
         let join_handle = thread::spawn(move || {
-            let mut worker = match ServedShMemServiceWorker::<SP>::new() {
+            let mut worker = match ServedShMemServiceWorker::<SP::ShMem, SP>::new() {
                 Ok(worker) => worker,
                 Err(e) => {
                     // Make sure the parent processes can continue
@@ -470,21 +451,19 @@ where
 }
 
 /// The struct for the worker, handling incoming requests for [`ShMem`].
-#[allow(clippy::type_complexity)]
-struct ServedShMemServiceWorker<SP>
-where
-    SP: ShMemProvider,
-{
+#[expect(clippy::type_complexity)]
+struct ServedShMemServiceWorker<SHM, SP> {
     provider: SP,
-    clients: HashMap<RawFd, SharedShMemClient<SP::ShMem>>,
+    clients: HashMap<RawFd, SharedShMemClient<SHM>>,
     /// Maps from a pre-fork (parent) client id to its cloned maps.
-    forking_clients: HashMap<RawFd, HashMap<i32, Vec<Rc<RefCell<SP::ShMem>>>>>,
-    all_shmems: HashMap<i32, Weak<RefCell<SP::ShMem>>>,
+    forking_clients: HashMap<RawFd, HashMap<i32, Vec<Rc<RefCell<SHM>>>>>,
+    all_shmems: HashMap<i32, Weak<RefCell<SHM>>>,
 }
 
-impl<SP> ServedShMemServiceWorker<SP>
+impl<SHM, SP> ServedShMemServiceWorker<SHM, SP>
 where
-    SP: ShMemProvider,
+    SHM: ShMem,
+    SP: ShMemProvider<ShMem = SHM>,
 {
     /// Create a new [`ShMemService`]
     fn new() -> Result<Self, Error> {
@@ -496,7 +475,7 @@ where
         })
     }
 
-    fn upgrade_shmem_with_id(&mut self, description_id: i32) -> Rc<RefCell<SP::ShMem>> {
+    fn upgrade_shmem_with_id(&mut self, description_id: i32) -> Rc<RefCell<SHM>> {
         self.all_shmems
             .get_mut(&description_id)
             .unwrap()
@@ -506,7 +485,7 @@ where
     }
 
     /// Read and handle the client request, send the answer over unix fd.
-    fn handle_request(&mut self, client_id: RawFd) -> Result<ServedShMemResponse<SP>, Error> {
+    fn handle_request(&mut self, client_id: RawFd) -> Result<ServedShMemResponse<SHM>, Error> {
         let request = self.read_request(client_id)?;
 
         // log::trace!("got ashmem client: {}, request:{:?}", client_id, request);
@@ -565,7 +544,7 @@ where
 
                 if client.maps.contains_key(&description_id) {
                     // Using let else here as self needs to be accessed in the else branch.
-                    #[allow(clippy::option_if_let_else)]
+                    #[expect(clippy::option_if_let_else)]
                     Ok(ServedShMemResponse::Mapping(
                         if let Some(map) = client
                             .maps
@@ -671,7 +650,7 @@ where
         };
 
         let mut poll_fds: Vec<PollFd> = vec![PollFd::new(
-            &listener,
+            listener.as_fd(),
             PollFlags::POLLIN | PollFlags::POLLRDNORM | PollFlags::POLLRDBAND,
         )];
 
@@ -680,18 +659,18 @@ where
         cvar.notify_one();
 
         loop {
-            match poll(&mut poll_fds, -1) {
+            match poll(&mut poll_fds, PollTimeout::NONE) {
                 Ok(num_fds) if num_fds > 0 => (),
                 Ok(_) => continue,
                 Err(e) => {
                     log::error!("Error polling for activity: {e:?}");
                     continue;
                 }
-            };
+            }
             let copied_poll_fds: Vec<PollFd> = poll_fds.clone();
             for poll_fd in copied_poll_fds {
                 let revents = poll_fd.revents().expect("revents should not be None");
-                let raw_polled_fd = unsafe { *((addr_of!(poll_fd)) as *const libc::pollfd) }.fd;
+                let raw_polled_fd = unsafe { *((&raw const poll_fd) as *const libc::pollfd) }.fd;
                 if revents.contains(PollFlags::POLLHUP) {
                     poll_fds.remove(poll_fds.iter().position(|item| *item == poll_fd).unwrap());
                     self.clients.remove(&raw_polled_fd);
@@ -701,9 +680,8 @@ where
                             Ok(()) => (),
                             Err(e) => {
                                 log::info!("Ignoring failed read from client {e:?} {poll_fd:?}");
-                                continue;
                             }
-                        };
+                        }
                     } else {
                         let (stream, _addr) = match listener.accept_unix_addr() {
                             Ok(stream_val) => stream_val,
@@ -717,11 +695,10 @@ where
 
                         let pollfd = PollFd::new(
                             // # Safety
-                            // This cast will make `PollFd::new` ignore the lifetime of our stream.
+                            // Going through a raw fd will make `PollFd::new` ignore the lifetime of our stream.
                             // As of nix 0.27, the `PollFd` is safer, in that it checks the lifetime of the given stream.
-                            // We did not develop this server with that new constraint in mind, but it is upheld.
-                            // The `new` function then gets the `raw_fd` from this stream, and operate on that int internally.
-                            unsafe { &*(&stream as *const _) },
+                            // We did not develop this server with that new constraint in mind, but it is upheld by our code.
+                            unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) },
                             PollFlags::POLLIN | PollFlags::POLLRDNORM | PollFlags::POLLRDBAND,
                         );
 
@@ -739,7 +716,7 @@ where
                             Err(e) => {
                                 log::info!("Ignoring failed read from client {e:?}");
                             }
-                        };
+                        }
                     }
                 } else {
                     //log::warn!("Unknown revents flags: {:?}", revents);

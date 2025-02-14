@@ -1,10 +1,12 @@
 //! Signal handling for unix
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+use core::mem::size_of;
 #[cfg(feature = "alloc")]
 use core::{
     cell::UnsafeCell,
-    ptr::{self, addr_of_mut, write_volatile},
+    ptr::{self, write_volatile},
     sync::atomic::{compiler_fence, Ordering},
 };
 use core::{
@@ -18,12 +20,15 @@ use std::ffi::CString;
 #[cfg(target_arch = "arm")]
 pub use libc::c_ulong;
 #[cfg(feature = "std")]
-use nix::errno::{errno, Errno};
+use nix::errno::Errno;
+
+/// The special exit code when the target exited through ctrl-c
+pub const CTRL_C_EXIT: i32 = 100;
 
 /// ARMv7-specific representation of a saved context
 #[cfg(target_arch = "arm")]
 #[derive(Debug)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 #[repr(C)]
 pub struct mcontext_t {
     /// Signal Number
@@ -73,7 +78,7 @@ pub struct mcontext_t {
 /// User Context Struct on `arm` `linux`
 #[cfg(all(target_os = "linux", target_arch = "arm"))]
 #[derive(Debug)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 #[repr(C)]
 pub struct ucontext_t {
     /// Flags
@@ -101,7 +106,8 @@ pub struct ucontext_t {
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[derive(Debug)]
 #[repr(C)]
-#[allow(clippy::pub_underscore_fields)]
+#[expect(clippy::pub_underscore_fields)]
+#[allow(non_camel_case_types)] // expect breaks for some reason
 pub struct arm_exception_state64 {
     /// Virtual Fault Address
     pub __far: u64,
@@ -126,7 +132,8 @@ pub struct arm_exception_state64 {
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[derive(Debug)]
 #[repr(C)]
-#[allow(clippy::pub_underscore_fields)]
+#[expect(clippy::pub_underscore_fields)]
+#[allow(non_camel_case_types)] // expect breaks for some reason
 pub struct arm_thread_state64 {
     /// General purpose registers x0-x28
     pub __x: [u64; 29],
@@ -152,12 +159,12 @@ pub struct arm_thread_state64 {
 /// ````
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[derive(Debug)]
-#[allow(non_camel_case_types)]
 #[repr(C, align(16))]
-//#[repr(align(16))]
+#[allow(non_camel_case_types)] // expect breaks for some reason
+                               //#[repr(align(16))]
 pub struct arm_neon_state64 {
     /// opaque
-    pub opaque: [u8; (32 * 16) + (2 * mem::size_of::<u32>())],
+    pub opaque: [u8; (32 * 16) + (2 * size_of::<u32>())],
 }
 
 /// ```c
@@ -169,16 +176,16 @@ pub struct arm_neon_state64 {
 ///};
 /// ```
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-#[allow(non_camel_case_types)]
 #[derive(Debug)]
 #[repr(C)]
-#[allow(clippy::pub_underscore_fields)]
+#[expect(clippy::pub_underscore_fields)]
+#[allow(non_camel_case_types)] // expect breaks for some reason
 pub struct mcontext64 {
-    /// _STRUCT_ARM_EXCEPTION_STATE64
+    /// `_STRUCT_ARM_EXCEPTION_STATE64`
     pub __es: arm_exception_state64,
-    /// _STRUCT_ARM_THREAD_STATE64
+    /// `_STRUCT_ARM_THREAD_STATE64`
     pub __ss: arm_thread_state64,
-    /// _STRUCT_ARM_NEON_STATE64
+    /// `_STRUCT_ARM_NEON_STATE64`
     pub __ns: arm_neon_state64,
 }
 
@@ -189,17 +196,17 @@ pub struct mcontext64 {
 /// __darwin_size_t ss_size;        /* signal stack length */
 /// int             ss_flags;       /* SA_DISABLE and/or SA_ONSTACK */
 /// };
-/// ````
+/// ```
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[derive(Debug)]
-#[allow(non_camel_case_types)]
 #[repr(C)]
+#[allow(non_camel_case_types)] // expect breaks for some reason
 pub struct sigaltstack {
     /// signal stack base
     pub ss_sp: *mut c_void,
     /// signal stack length
     pub ss_size: libc::size_t,
-    /// SA_DISABLE and/or SA_ONSTACK
+    /// `SA_DISABLE` and/or `SA_ONSTACK`
     pub ss_flags: c_int,
 }
 
@@ -221,8 +228,8 @@ pub struct sigaltstack {
 /// ```
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[derive(Debug)]
-#[allow(non_camel_case_types)]
 #[repr(C)]
+#[allow(non_camel_case_types)] // expect breaks for some reason
 pub struct ucontext_t {
     /// onstack
     pub uc_onstack: c_int,
@@ -263,7 +270,7 @@ use crate::Error;
 
 extern "C" {
     /// The `libc` `getcontext`
-    /// For some reason, it's not available on MacOS.
+    /// For some reason, it's not available on `MacOS`.
     ///
     fn getcontext(ucp: *mut ucontext_t) -> c_int;
 }
@@ -300,6 +307,19 @@ pub enum Signal {
     SigInterrupt = SIGINT,
     /// `SIGTRAP` signal id
     SigTrap = SIGTRAP,
+}
+
+#[cfg(feature = "std")]
+impl Signal {
+    /// Handle an incoming signal
+    pub fn handle(&self) {
+        match self {
+            Signal::SigInterrupt | Signal::SigQuit | Signal::SigTerm => {
+                std::process::exit(CTRL_C_EXIT)
+            }
+            _ => {}
+        }
+    }
 }
 
 impl TryFrom<&str> for Signal {
@@ -361,7 +381,7 @@ impl Display for Signal {
             Signal::SigTerm => write!(f, "SIGTERM")?,
             Signal::SigInterrupt => write!(f, "SIGINT")?,
             Signal::SigTrap => write!(f, "SIGTRAP")?,
-        };
+        }
 
         Ok(())
     }
@@ -369,16 +389,25 @@ impl Display for Signal {
 
 /// A trait for `LibAFL` signal handling
 #[cfg(feature = "alloc")]
-pub trait Handler {
+pub trait SignalHandler {
     /// Handle a signal
-    fn handle(&mut self, signal: Signal, info: &mut siginfo_t, _context: Option<&mut ucontext_t>);
+    ///
+    /// # Safety
+    /// This is generally not safe to call. It should only be called through the signal it was registered for.
+    /// Signal handling is hard, don't mess with it :).
+    unsafe fn handle(
+        &mut self,
+        signal: Signal,
+        info: &mut siginfo_t,
+        _context: Option<&mut ucontext_t>,
+    );
     /// Return a list of signals to handle
     fn signals(&self) -> Vec<Signal>;
 }
 
 #[cfg(feature = "alloc")]
 struct HandlerHolder {
-    handler: UnsafeCell<*mut dyn Handler>,
+    handler: UnsafeCell<*mut dyn SignalHandler>,
 }
 
 #[cfg(feature = "alloc")]
@@ -423,6 +452,7 @@ unsafe fn handle_signal(sig: c_int, info: *mut siginfo_t, void: *mut c_void) {
 }
 
 /// Setup signal handlers in a somewhat rusty way.
+///
 /// This will allocate a signal stack and set the signal handlers accordingly.
 /// It is, for example, used in `LibAFL's` `InProcessExecutor` to restart the fuzzer in case of a crash,
 /// or to handle `SIGINT` in the broker process.
@@ -433,7 +463,9 @@ unsafe fn handle_signal(sig: c_int, info: *mut siginfo_t, void: *mut c_void) {
 /// The handler pointer will be dereferenced, and the data the pointer points to may therefore not move.
 /// A lot can go south in signal handling. Be sure you know what you are doing.
 #[cfg(feature = "alloc")]
-pub unsafe fn setup_signal_handler<T: 'static + Handler>(handler: *mut T) -> Result<(), Error> {
+pub unsafe fn setup_signal_handler<T: 'static + SignalHandler>(
+    handler: *mut T,
+) -> Result<(), Error> {
     // First, set up our own stack to be used during segfault handling. (and specify `SA_ONSTACK` in `sigaction`)
     if SIGNAL_STACK_PTR.is_null() {
         SIGNAL_STACK_PTR = malloc(SIGNAL_STACK_SIZE);
@@ -447,23 +479,23 @@ pub unsafe fn setup_signal_handler<T: 'static + Handler>(handler: *mut T) -> Res
     let mut ss: stack_t = mem::zeroed();
     ss.ss_size = SIGNAL_STACK_SIZE;
     ss.ss_sp = SIGNAL_STACK_PTR;
-    sigaltstack(addr_of_mut!(ss), ptr::null_mut() as _);
+    sigaltstack(&raw mut ss, ptr::null_mut() as _);
 
     let mut sa: sigaction = mem::zeroed();
-    sigemptyset(addr_of_mut!(sa.sa_mask));
-    sigaddset(addr_of_mut!(sa.sa_mask), SIGALRM);
+    sigemptyset(&raw mut sa.sa_mask);
+    sigaddset(&raw mut sa.sa_mask, SIGALRM);
     sa.sa_flags = SA_NODEFER | SA_SIGINFO | SA_ONSTACK;
     sa.sa_sigaction = handle_signal as usize;
     let signals = unsafe { (*handler).signals() };
     for sig in signals {
         write_volatile(
-            addr_of_mut!(SIGNAL_HANDLERS[sig as usize]),
+            &raw mut SIGNAL_HANDLERS[sig as usize],
             Some(HandlerHolder {
-                handler: UnsafeCell::new(handler as *mut dyn Handler),
+                handler: UnsafeCell::new(handler as *mut dyn SignalHandler),
             }),
         );
 
-        if sigaction(sig as i32, addr_of_mut!(sa), ptr::null_mut()) < 0 {
+        if sigaction(sig as i32, &raw mut sa, ptr::null_mut()) < 0 {
             #[cfg(feature = "std")]
             {
                 let err_str = CString::new(format!("Failed to setup {sig} handler")).unwrap();
@@ -478,17 +510,18 @@ pub unsafe fn setup_signal_handler<T: 'static + Handler>(handler: *mut T) -> Res
 }
 
 /// Function to get the current [`ucontext_t`] for this process.
+///
 /// This calls the libc `getcontext` function under the hood.
 /// It can be useful, for example for `dump_regs`.
 /// Note that calling this method may, of course, alter the state.
 /// We wrap it here, as it seems to be (currently)
 /// not available on `MacOS` in the `libc` crate.
 #[cfg(unix)]
-#[allow(clippy::inline_always)] // we assume that inlining will destroy less state
+#[expect(clippy::inline_always)] // we assume that inlining will destroy less state
 #[inline(always)]
 pub fn ucontext() -> Result<ucontext_t, Error> {
     let mut ucontext = unsafe { mem::zeroed() };
-    if cfg!(not(target_os = "openbsd")) {
+    if cfg!(not(any(target_os = "openbsd", target_os = "haiku"))) {
         if unsafe { getcontext(&mut ucontext) } == 0 {
             Ok(ucontext)
         } else {
@@ -502,7 +535,7 @@ pub fn ucontext() -> Result<ucontext_t, Error> {
             #[cfg(feature = "std")]
             Err(Error::unknown(format!(
                 "Failed to get ucontext: {:?}",
-                Errno::from_i32(errno())
+                Errno::last()
             )))
         }
     } else {

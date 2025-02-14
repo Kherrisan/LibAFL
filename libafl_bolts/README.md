@@ -9,7 +9,7 @@ Some cross-platform things in bolts include (but are not limited to):
 * ShMem: A cross-platform (Windows, Linux, Android, MacOS) shared memory implementation
 * LLMP: A fast, lock-free IPC mechanism via SharedMap
 * Core_affinity: A maintained version of `core_affinity` that can be used to get core information and bind processes to cores
-* Rands: Fast random number generators for fuzzing (like [RomuRand](http://www.romu-random.org/))
+* Rands: Fast random number generators for fuzzing (like [RomuRand](https://www.romu-random.org/))
 * MiniBSOD: get and print information about the current process state including important registers.
 * Tuples: Haskel-like compile-time tuple lists
 * Os: OS specific stuff like signal handling, windows exception handling, pipes, and helpers for `fork`
@@ -28,7 +28,7 @@ For bugs, feel free to open issues or contact us directly. Thank you for your su
 
 Even though we will gladly assist you in finishing up your PR, try to
 - keep all the crates compiling with *stable* rust (hide the eventual non-stable code under [`cfg`s](https://github.com/AFLplusplus/LibAFL/blob/main/libafl/build.rs#L26))
-- run `cargo fmt` on your code before pushing
+- run `cargo nightly fmt` on your code before pushing
 - check the output of `cargo clippy --all` or `./clippy.sh`
 - run `cargo build --no-default-features` to check for `no_std` compatibility (and possibly add `#[cfg(feature = "std")]`) to hide parts of your code.
 
@@ -37,8 +37,8 @@ Some of the parts in this list may be hard, don't be afraid to open a PR if you 
 #### License
 
 <sup>
-Licensed under either of <a href="LICENSE-APACHE">Apache License, Version
-2.0</a> or <a href="LICENSE-MIT">MIT license</a> at your option.
+Licensed under either of <a href="../LICENSE-APACHE">Apache License, Version
+2.0</a> or <a href="../LICENSE-MIT">MIT license</a> at your option.
 </sup>
 
 <br>

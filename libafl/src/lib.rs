@@ -4,74 +4,49 @@ Welcome to `LibAFL`
 #![doc = include_str!("../README.md")]
 /*! */
 #![cfg_attr(feature = "document-features", doc = document_features::document_features!())]
-#![allow(incomplete_features)]
 #![no_std]
 // For `type_eq`
 #![cfg_attr(nightly, feature(specialization))]
 // For `std::simd`
 #![cfg_attr(nightly, feature(portable_simd))]
-#![warn(clippy::cargo)]
-#![allow(ambiguous_glob_reexports)]
-#![deny(clippy::cargo_common_metadata)]
-#![deny(rustdoc::broken_intra_doc_links)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-#![allow(
-    clippy::unreadable_literal,
-    clippy::type_repetition_in_bounds,
-    clippy::missing_errors_doc,
-    clippy::cast_possible_truncation,
-    clippy::used_underscore_binding,
-    clippy::ptr_as_ptr,
-    clippy::missing_panics_doc,
-    clippy::missing_docs_in_private_items,
-    clippy::module_name_repetitions,
-    clippy::ptr_cast_constness,
-    clippy::unsafe_derive_deserialize
+#![cfg_attr(
+    not(test),
+    warn(
+        missing_debug_implementations,
+        missing_docs,
+        trivial_numeric_casts,
+        unused_extern_crates,
+        unused_import_braces,
+        unused_qualifications,
+    )
 )]
-#![cfg_attr(not(test), warn(
-    missing_debug_implementations,
-    missing_docs,
-    //trivial_casts,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unused_import_braces,
-    unused_qualifications,
-    //unused_results
-))]
-#![cfg_attr(test, deny(
-    missing_debug_implementations,
-    missing_docs,
-    //trivial_casts,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unused_import_braces,
-    unused_qualifications,
-    unused_must_use,
-    //unused_results
-))]
 #![cfg_attr(
     test,
     deny(
         bad_style,
         dead_code,
         improper_ctypes,
-        non_shorthand_field_patterns,
+        missing_debug_implementations,
+        missing_docs,
         no_mangle_generic_items,
+        non_shorthand_field_patterns,
         overflowing_literals,
         path_statements,
         patterns_in_fns_without_body,
+        trivial_numeric_casts,
         unconditional_recursion,
-        unused,
+        unfulfilled_lint_expectations,
         unused_allocation,
         unused_comparisons,
+        unused_extern_crates,
+        unused_import_braces,
+        unused_must_use,
         unused_parens,
+        unused_qualifications,
+        unused,
         while_true
     )
 )]
-// Till they fix this buggy lint in clippy
-#![allow(clippy::borrow_as_ptr)]
-#![allow(clippy::borrow_deref_ref)]
 
 #[cfg(feature = "std")]
 #[macro_use]
@@ -82,20 +57,15 @@ pub extern crate alloc;
 
 // Re-export derive(SerdeAny)
 #[cfg(feature = "derive")]
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 #[macro_use]
 extern crate libafl_derive;
-/// Dummy export that will warn with a deprecation note on usage.
-/// Use the `libafl_bolts` crate instead.
-#[deprecated(
-    since = "0.11.0",
-    note = "All LibAFL bolts have moved to the libafl_bolts crate."
-)]
-pub mod bolts {}
 #[cfg(feature = "derive")]
 #[doc(hidden)]
 pub use libafl_derive::*;
 
+pub mod common;
+pub use common::*;
 pub mod corpus;
 pub mod events;
 pub mod executors;
@@ -111,11 +81,13 @@ pub mod stages;
 pub mod state;
 
 pub use fuzzer::*;
-pub use libafl_bolts::Error;
+pub use libafl_bolts::{nonzero, Error};
 
 /// The purpose of this module is to alleviate imports of many components by adding a glob import.
 #[cfg(feature = "prelude")]
 pub mod prelude {
+    #![expect(ambiguous_glob_reexports)]
+
     pub use super::{
         corpus::*, events::*, executors::*, feedbacks::*, fuzzer::*, generators::*, inputs::*,
         monitors::*, mutators::*, observers::*, schedulers::*, stages::*, state::*, *,
@@ -134,8 +106,15 @@ pub unsafe extern "C" fn external_current_millis() -> u64 {
 #[cfg(test)]
 mod tests {
 
-    use libafl_bolts::{rands::StdRand, tuples::tuple_list};
+    #[cfg(miri)]
+    use libafl_bolts::serdeany::RegistryBuilder;
+    use libafl_bolts::{
+        rands::{RomuDuoJrRand, StdRand},
+        tuples::tuple_list,
+    };
 
+    #[cfg(miri)]
+    use crate::stages::ExecutionCountRestartHelperMetadata;
     use crate::{
         corpus::{Corpus, InMemoryCorpus, Testcase},
         events::NopEventManager,
@@ -152,8 +131,14 @@ mod tests {
     };
 
     #[test]
-    #[allow(clippy::similar_names)]
     fn test_fuzzer() {
+        // # Safety
+        // No concurrency per testcase
+        #[cfg(miri)]
+        unsafe {
+            RegistryBuilder::register::<ExecutionCountRestartHelperMetadata>();
+        }
+
         let rand = StdRand::with_seed(0);
 
         let mut corpus = InMemoryCorpus::<BytesInput>::new();
@@ -207,71 +192,24 @@ mod tests {
 
         let state_serialized = postcard::to_allocvec(&state).unwrap();
         let state_deserialized: StdState<
-            _,
             InMemoryCorpus<BytesInput>,
+            _,
             StdRand,
             InMemoryCorpus<BytesInput>,
-        > = postcard::from_bytes(state_serialized.as_slice()).unwrap();
+        > = postcard::from_bytes::<
+            StdState<
+                InMemoryCorpus<BytesInput>,
+                BytesInput,
+                RomuDuoJrRand,
+                InMemoryCorpus<BytesInput>,
+            >,
+        >(state_serialized.as_slice())
+        .unwrap();
         assert_eq!(state.corpus().count(), state_deserialized.corpus().count());
 
         let corpus_serialized = postcard::to_allocvec(state.corpus()).unwrap();
         let corpus_deserialized: InMemoryCorpus<BytesInput> =
             postcard::from_bytes(corpus_serialized.as_slice()).unwrap();
         assert_eq!(state.corpus().count(), corpus_deserialized.count());
-    }
-}
-
-#[cfg(feature = "python")]
-#[allow(missing_docs)]
-pub mod pybind {
-    use pyo3::prelude::*;
-
-    use super::{
-        corpus, events, executors, feedbacks, fuzzer, generators, monitors, mutators, observers,
-        stages, state,
-    };
-
-    #[derive(Debug, Clone)]
-    pub struct PythonMetadata {
-        pub map: PyObject,
-    }
-
-    libafl_bolts::impl_serde_pyobjectwrapper!(PythonMetadata, map);
-    libafl_bolts::impl_serdeany!(PythonMetadata);
-
-    impl PythonMetadata {
-        #[must_use]
-        pub fn new(map: PyObject) -> Self {
-            Self { map }
-        }
-    }
-
-    #[pymodule]
-    #[pyo3(name = "libafl")]
-    /// Register the classes to the python module
-    pub fn python_module(py: Python, m: &PyModule) -> PyResult<()> {
-        libafl_bolts::rands::pybind::register(py, m)?;
-        observers::map::pybind::register(py, m)?;
-        observers::pybind::register(py, m)?;
-        feedbacks::map::pybind::register(py, m)?;
-        feedbacks::pybind::register(py, m)?;
-        state::pybind::register(py, m)?;
-        monitors::pybind::register(py, m)?;
-        events::pybind::register(py, m)?;
-        events::simple::pybind::register(py, m)?;
-        fuzzer::pybind::register(py, m)?;
-        executors::pybind::register(py, m)?;
-        executors::inprocess::pybind::register(py, m)?;
-        generators::pybind::register(py, m)?;
-        mutators::pybind::register(py, m)?;
-        mutators::scheduled::pybind::register(py, m)?;
-        corpus::pybind::register(py, m)?;
-        corpus::testcase::pybind::register(py, m)?;
-        corpus::ondisk::pybind::register(py, m)?;
-        corpus::inmemory::pybind::register(py, m)?;
-        corpus::cached::pybind::register(py, m)?;
-        stages::pybind::register(py, m)?;
-        stages::mutational::pybind::register(py, m)?;
-        Ok(())
     }
 }

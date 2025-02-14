@@ -6,63 +6,48 @@
 
 #ifdef SANCOV_CMPLOG
   #include "cmplog.h"
-  #include <sanitizer/common_interface_defs.h>
 #endif
+
+// Note: for RETADDR to give us the fuzz target caller address we need 
+//       to guarantee that this code is inlined. `inline` keyword provides
+//       no such guarantees, but a macro does.
+#ifdef SANCOV_VALUE_PROFILE
+  #define SANCOV_VALUE_PROFILE_CALL(k, arg_size, arg1, arg2, arg1_is_const) \
+    k &= CMP_MAP_SIZE - 1; \
+    __libafl_targets_value_profile1(k, arg1, arg2);
+#else
+  #define SANCOV_VALUE_PROFILE_CALL(k, arg_size, arg1, arg2, arg1_is_const)
+#endif
+
+#ifdef SANCOV_CMPLOG
+  #define SANCOV_CMPLOG_CALL(k, arg_size, arg1, arg2, arg1_is_const) \
+    k &= CMPLOG_MAP_W - 1; \
+    cmplog_instructions_checked(k, arg_size, (uint64_t)arg1, (uint64_t)arg2, arg1_is_const);
+#else
+  #define SANCOV_CMPLOG_CALL(k, arg_size, arg1, arg2, arg1_is_const)
+#endif
+
+#define HANDLE_SANCOV_TRACE_CMP(arg_size, arg1, arg2, arg1_is_const) { \
+  uintptr_t k = RETADDR; \
+  k = (k >> 4) ^ (k << 8); \
+  SANCOV_VALUE_PROFILE_CALL(k, arg_size, arg1, arg2, arg1_is_const) \
+  SANCOV_CMPLOG_CALL(k, arg_size, arg1, arg2, arg1_is_const) \
+}
 
 void __sanitizer_cov_trace_cmp1(uint8_t arg1, uint8_t arg2) {
-  uintptr_t k = RETADDR;
-  k = (k >> 4) ^ (k << 8);
-
-#ifdef SANCOV_VALUE_PROFILE
-  k &= CMP_MAP_SIZE - 1;
-  __libafl_targets_value_profile1(k, arg1, arg2);
-#endif
-#ifdef SANCOV_CMPLOG
-  k &= CMPLOG_MAP_W - 1;
-  __libafl_targets_cmplog_instructions(k, 1, (uint64_t)arg1, (uint64_t)arg2);
-#endif
+  HANDLE_SANCOV_TRACE_CMP(1, arg1, arg2, 0);
 }
 
 void __sanitizer_cov_trace_cmp2(uint16_t arg1, uint16_t arg2) {
-  uintptr_t k = RETADDR;
-  k = (k >> 4) ^ (k << 8);
-
-#ifdef SANCOV_VALUE_PROFILE
-  k &= CMP_MAP_SIZE - 1;
-  __libafl_targets_value_profile2(k, arg1, arg2);
-#endif
-#ifdef SANCOV_CMPLOG
-  k &= CMPLOG_MAP_W - 1;
-  __libafl_targets_cmplog_instructions(k, 2, (uint64_t)arg1, (uint64_t)arg2);
-#endif
+  HANDLE_SANCOV_TRACE_CMP(2, arg1, arg2, 0);
 }
 
 void __sanitizer_cov_trace_cmp4(uint32_t arg1, uint32_t arg2) {
-  uintptr_t k = RETADDR;
-  k = (k >> 4) ^ (k << 8);
-
-#ifdef SANCOV_VALUE_PROFILE
-  k &= CMP_MAP_SIZE - 1;
-  __libafl_targets_value_profile4(k, arg1, arg2);
-#endif
-#ifdef SANCOV_CMPLOG
-  k &= CMPLOG_MAP_W - 1;
-  __libafl_targets_cmplog_instructions(k, 4, (uint64_t)arg1, (uint64_t)arg2);
-#endif
+  HANDLE_SANCOV_TRACE_CMP(4, arg1, arg2, 0);
 }
 
 void __sanitizer_cov_trace_cmp8(uint64_t arg1, uint64_t arg2) {
-  uintptr_t k = RETADDR;
-  k = (k >> 4) ^ (k << 8);
-
-#ifdef SANCOV_VALUE_PROFILE
-  k &= CMP_MAP_SIZE - 1;
-  __libafl_targets_value_profile8(k, arg1, arg2);
-#endif
-#ifdef SANCOV_CMPLOG
-  k &= CMPLOG_MAP_W - 1;
-  __libafl_targets_cmplog_instructions(k, 8, (uint64_t)arg1, (uint64_t)arg2);
-#endif
+  HANDLE_SANCOV_TRACE_CMP(8, arg1, arg2, 0);
 }
 
 void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
@@ -95,89 +80,27 @@ void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
 #endif
 #ifdef SANCOV_CMPLOG
     k &= CMPLOG_MAP_W - 1;
-    __libafl_targets_cmplog_instructions(k, cases[1] / 8, val, cases[i + 2]);
+    // Note: cases[i + 2] are the constant values, so keep them in arg1 and indicate that it's const
+    cmplog_instructions_checked(k, cases[1] / 8, cases[i + 2], val, 1);
 #endif
   }
 }
 
 void __sanitizer_cov_trace_const_cmp1(uint8_t arg1, uint8_t arg2) {
-  __sanitizer_cov_trace_cmp1(arg1, arg2);
+  HANDLE_SANCOV_TRACE_CMP(1, arg1, arg2, 1);
 }
 
 void __sanitizer_cov_trace_const_cmp2(uint16_t arg1, uint16_t arg2) {
-  __sanitizer_cov_trace_cmp2(arg1, arg2);
+  HANDLE_SANCOV_TRACE_CMP(2, arg1, arg2, 1);
 }
 
 void __sanitizer_cov_trace_const_cmp4(uint32_t arg1, uint32_t arg2) {
-  __sanitizer_cov_trace_cmp4(arg1, arg2);
+  HANDLE_SANCOV_TRACE_CMP(4, arg1, arg2, 1);
 }
 
 void __sanitizer_cov_trace_const_cmp8(uint64_t arg1, uint64_t arg2) {
-  __sanitizer_cov_trace_cmp8(arg1, arg2);
+  HANDLE_SANCOV_TRACE_CMP(8, arg1, arg2, 1);
 }
-
-#ifdef SANCOV_CMPLOG
-
-void __sanitizer_weak_hook_memcmp(void *called_pc, const void *s1,
-                                  const void *s2, size_t n, int result) {
-  if (result != 0) {
-    uintptr_t k = (uintptr_t)called_pc;
-    k = (k >> 4) ^ (k << 8);
-    k &= CMPLOG_MAP_W - 1;
-
-    __libafl_targets_cmplog_routines_len(k, s1, s2, MIN(n, 32));
-  }
-}
-
-void __sanitizer_weak_hook_strncmp(void *called_pc, const char *s1,
-                                   const char *s2, size_t n, int result) {
-  if (result != 0) {
-    n = MIN(n, 32);
-
-    uintptr_t k = (uintptr_t)called_pc;
-    k = (k >> 4) ^ (k << 8);
-    k &= CMPLOG_MAP_W - 1;
-
-    size_t actual_len;
-    for (actual_len = 0; actual_len < n; actual_len++) {
-      if (s1[actual_len] == 0 || s2[actual_len] == 0) { break; }
-    }
-
-    __libafl_targets_cmplog_routines_len(k, (const uint8_t *)s1,
-                                         (const uint8_t *)s2, actual_len);
-  }
-}
-
-void __sanitizer_weak_hook_strncasecmp(void *called_pc, const char *s1,
-                                       const char *s2, size_t n, int result) {
-  __sanitizer_weak_hook_strncmp(called_pc, s1, s2, n, result);
-}
-
-void __sanitizer_weak_hook_strcmp(void *called_pc, const char *s1,
-                                  const char *s2, int result) {
-  if (result != 0) {
-    uintptr_t k = (uintptr_t)called_pc;
-    k = (k >> 4) ^ (k << 8);
-    k &= CMPLOG_MAP_W - 1;
-
-    size_t actual_len;
-    for (actual_len = 0; actual_len < 32; actual_len++) {
-      if (s1[actual_len] == 0 || s2[actual_len] == 0) { break; }
-    }
-
-    __libafl_targets_cmplog_routines_len(k, (const uint8_t *)s1,
-                                         (const uint8_t *)s2, actual_len);
-  }
-}
-
-void __sanitizer_weak_hook_strcasecmp(void *called_pc, const char *s1,
-                                      const char *s2, int result) {
-  __sanitizer_weak_hook_strcmp(called_pc, s1, s2, result);
-}
-
-// strstr, strcasestr, memmem unhandled
-
-#endif
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"

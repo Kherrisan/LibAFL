@@ -1,20 +1,22 @@
 //! The [`InMemoryOnDiskCorpus`] stores [`Testcase`]s to disk.
+//!
 //! Additionally, _all_ of them are kept in memory.
 //! For a lower memory footprint, consider using [`crate::corpus::CachedOnDiskCorpus`]
 //! which only stores a certain number of [`Testcase`]s and removes additional ones in a FIFO manner.
 
-use alloc::string::String;
-use core::{cell::RefCell, time::Duration};
-#[cfg(feature = "std")]
-use std::{fs, fs::File, io::Write};
+use alloc::string::{String, ToString};
+use core::cell::{Ref, RefCell, RefMut};
 use std::{
-    fs::OpenOptions,
+    fs,
+    fs::{File, OpenOptions},
+    io,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
+use fs2::FileExt;
 #[cfg(feature = "gzip")]
 use libafl_bolts::compress::GzipCompressor;
-use libafl_bolts::serdeany::SerdeAnyMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -23,30 +25,38 @@ use super::{
 };
 use crate::{
     corpus::{Corpus, CorpusId, InMemoryCorpus, Testcase},
-    inputs::{Input, UsesInput},
-    state::HasMetadata,
-    Error,
+    inputs::Input,
+    Error, HasMetadata,
 };
 
-/// The [`Testcase`] metadata that'll be stored to disk
-#[cfg(feature = "std")]
-#[derive(Debug, Serialize)]
-pub struct InMemoryOnDiskMetadata<'a> {
-    metadata: &'a SerdeAnyMap,
-    exec_time: &'a Option<Duration>,
-    executions: &'a usize,
+/// Creates the given `path` and returns an error if it fails.
+/// If the create succeeds, it will return the file.
+/// If the create fails for _any_ reason, including, but not limited to, a preexisting existing file of that name,
+/// it will instead return the respective [`io::Error`].
+fn create_new<P: AsRef<Path>>(path: P) -> Result<File, io::Error> {
+    OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Tries to create the given `path` and returns `None` _only_ if the file already existed.
+/// If the create succeeds, it will return the file.
+/// If the create fails for some other reason, it will instead return the respective [`io::Error`].
+fn try_create_new<P: AsRef<Path>>(path: P) -> Result<Option<File>, io::Error> {
+    match create_new(path) {
+        Ok(ret) => Ok(Some(ret)),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// A corpus able to store [`Testcase`]s to disk, while also keeping all of them in memory.
 ///
 /// Metadata is written to a `.<filename>.metadata` file in the same folder by default.
-#[cfg(feature = "std")]
 #[derive(Default, Serialize, Deserialize, Clone, Debug)]
-#[serde(bound = "I: serde::de::DeserializeOwned")]
-pub struct InMemoryOnDiskCorpus<I>
-where
-    I: Input,
-{
+pub struct InMemoryOnDiskCorpus<I> {
     inner: InMemoryCorpus<I>,
     dir_path: PathBuf,
     meta_format: Option<OnDiskMetadataFormat>,
@@ -54,56 +64,76 @@ where
     locking: bool,
 }
 
-impl<I> UsesInput for InMemoryOnDiskCorpus<I>
+impl<I> Corpus<I> for InMemoryOnDiskCorpus<I>
 where
     I: Input,
 {
-    type Input = I;
-}
-
-impl<I> Corpus for InMemoryOnDiskCorpus<I>
-where
-    I: Input,
-{
-    /// Returns the number of elements
+    /// Returns the number of all enabled entries
     #[inline]
     fn count(&self) -> usize {
         self.inner.count()
     }
 
-    /// Add an entry to the corpus and return its index
+    /// Returns the number of all disabled entries
+    fn count_disabled(&self) -> usize {
+        self.inner.count_disabled()
+    }
+
+    /// Returns the number of elements including disabled entries
+    #[inline]
+    fn count_all(&self) -> usize {
+        self.inner.count_all()
+    }
+
+    /// Add an enabled testcase to the corpus and return its index
     #[inline]
     fn add(&mut self, testcase: Testcase<I>) -> Result<CorpusId, Error> {
-        let idx = self.inner.add(testcase)?;
-        let testcase = &mut self.get(idx).unwrap().borrow_mut();
-        self.save_testcase(testcase, idx)?;
+        let id = self.inner.add(testcase)?;
+        let testcase = &mut self.get(id).unwrap().borrow_mut();
+        self.save_testcase(testcase, Some(id))?;
         *testcase.input_mut() = None;
-        Ok(idx)
+        Ok(id)
+    }
+
+    /// Add a disabled testcase to the corpus and return its index
+    #[inline]
+    fn add_disabled(&mut self, testcase: Testcase<I>) -> Result<CorpusId, Error> {
+        let id = self.inner.add_disabled(testcase)?;
+        let testcase = &mut self.get_from_all(id).unwrap().borrow_mut();
+        self.save_testcase(testcase, Some(id))?;
+        *testcase.input_mut() = None;
+        Ok(id)
     }
 
     /// Replaces the testcase at the given idx
     #[inline]
-    fn replace(&mut self, idx: CorpusId, testcase: Testcase<I>) -> Result<Testcase<I>, Error> {
-        let entry = self.inner.replace(idx, testcase)?;
+    fn replace(&mut self, id: CorpusId, testcase: Testcase<I>) -> Result<Testcase<I>, Error> {
+        let entry = self.inner.replace(id, testcase)?;
         self.remove_testcase(&entry)?;
-        let testcase = &mut self.get(idx).unwrap().borrow_mut();
-        self.save_testcase(testcase, idx)?;
+        let testcase = &mut self.get(id).unwrap().borrow_mut();
+        self.save_testcase(testcase, Some(id))?;
         *testcase.input_mut() = None;
         Ok(entry)
     }
 
-    /// Removes an entry from the corpus, returning it if it was present.
+    /// Removes an entry from the corpus, returning it if it was present; considers both enabled and disabled corpus
     #[inline]
-    fn remove(&mut self, idx: CorpusId) -> Result<Testcase<I>, Error> {
-        let entry = self.inner.remove(idx)?;
+    fn remove(&mut self, id: CorpusId) -> Result<Testcase<I>, Error> {
+        let entry = self.inner.remove(id)?;
         self.remove_testcase(&entry)?;
         Ok(entry)
     }
 
-    /// Get by id
+    /// Get by id; considers only enabled testcases
     #[inline]
-    fn get(&self, idx: CorpusId) -> Result<&RefCell<Testcase<I>>, Error> {
-        self.inner.get(idx)
+    fn get(&self, id: CorpusId) -> Result<&RefCell<Testcase<I>>, Error> {
+        self.inner.get(id)
+    }
+
+    /// Get by id; considers both enabled and disabled testcases
+    #[inline]
+    fn get_from_all(&self, id: CorpusId) -> Result<&RefCell<Testcase<I>>, Error> {
+        self.inner.get_from_all(id)
     }
 
     /// Current testcase scheduled
@@ -119,13 +149,19 @@ where
     }
 
     #[inline]
-    fn next(&self, idx: CorpusId) -> Option<CorpusId> {
-        self.inner.next(idx)
+    fn next(&self, id: CorpusId) -> Option<CorpusId> {
+        self.inner.next(id)
+    }
+
+    /// Peek the next free corpus id
+    #[inline]
+    fn peek_free_id(&self) -> CorpusId {
+        self.inner.peek_free_id()
     }
 
     #[inline]
-    fn prev(&self, idx: CorpusId) -> Option<CorpusId> {
-        self.inner.prev(idx)
+    fn prev(&self, id: CorpusId) -> Option<CorpusId> {
+        self.inner.prev(id)
     }
 
     #[inline]
@@ -138,12 +174,18 @@ where
         self.inner.last()
     }
 
+    /// Get the nth corpus id; considers only enabled testcases
     #[inline]
     fn nth(&self, nth: usize) -> CorpusId {
         self.inner.nth(nth)
     }
+    /// Get the nth corpus id; considers both enabled and disabled testcases
+    #[inline]
+    fn nth_from_all(&self, nth: usize) -> CorpusId {
+        self.inner.nth_from_all(nth)
+    }
 
-    fn load_input_into(&self, testcase: &mut Testcase<Self::Input>) -> Result<(), Error> {
+    fn load_input_into(&self, testcase: &mut Testcase<I>) -> Result<(), Error> {
         if testcase.input_mut().is_none() {
             let Some(file_path) = testcase.file_path().as_ref() else {
                 return Err(Error::illegal_argument(
@@ -156,7 +198,7 @@ where
         Ok(())
     }
 
-    fn store_input_from(&self, testcase: &Testcase<Self::Input>) -> Result<(), Error> {
+    fn store_input_from(&self, testcase: &Testcase<I>) -> Result<(), Error> {
         // Store the input to disk
         let Some(file_path) = testcase.file_path() else {
             return Err(Error::illegal_argument(
@@ -172,29 +214,20 @@ where
     }
 }
 
-impl<I> HasTestcase for InMemoryOnDiskCorpus<I>
+impl<I> HasTestcase<I> for InMemoryOnDiskCorpus<I>
 where
     I: Input,
 {
-    fn testcase(
-        &self,
-        id: CorpusId,
-    ) -> Result<core::cell::Ref<Testcase<<Self as UsesInput>::Input>>, Error> {
+    fn testcase(&self, id: CorpusId) -> Result<Ref<Testcase<I>>, Error> {
         Ok(self.get(id)?.borrow())
     }
 
-    fn testcase_mut(
-        &self,
-        id: CorpusId,
-    ) -> Result<core::cell::RefMut<Testcase<<Self as UsesInput>::Input>>, Error> {
+    fn testcase_mut(&self, id: CorpusId) -> Result<RefMut<Testcase<I>>, Error> {
         Ok(self.get(id)?.borrow_mut())
     }
 }
 
-impl<I> InMemoryOnDiskCorpus<I>
-where
-    I: Input,
-{
+impl<I> InMemoryOnDiskCorpus<I> {
     /// Creates an [`InMemoryOnDiskCorpus`].
     ///
     /// This corpus stores all testcases to disk, and keeps all of them in memory, as well.
@@ -206,7 +239,7 @@ where
     /// If you don't want metadata, use [`InMemoryOnDiskCorpus::no_meta`].
     /// To pick a different metadata format, use [`InMemoryOnDiskCorpus::with_meta_format`].
     ///
-    /// Will error, if [`std::fs::create_dir_all()`] failed for `dir_path`.
+    /// Will error, if [`fs::create_dir_all()`] failed for `dir_path`.
     pub fn new<P>(dir_path: P) -> Result<Self, Error>
     where
         P: AsRef<Path>,
@@ -221,7 +254,7 @@ where
 
     /// Creates the [`InMemoryOnDiskCorpus`] specifying the format in which `Metadata` will be saved to disk.
     ///
-    /// Will error, if [`std::fs::create_dir_all()`] failed for `dir_path`.
+    /// Will error, if [`fs::create_dir_all()`] failed for `dir_path`.
     pub fn with_meta_format<P>(
         dir_path: P,
         meta_format: Option<OnDiskMetadataFormat>,
@@ -235,7 +268,7 @@ where
     /// Creates the [`InMemoryOnDiskCorpus`] specifying the format in which `Metadata` will be saved to disk
     /// and the prefix for the filenames.
     ///
-    /// Will error, if [`std::fs::create_dir_all()`] failed for `dir_path`.
+    /// Will error, if [`fs::create_dir_all()`] failed for `dir_path`.
     pub fn with_meta_format_and_prefix<P>(
         dir_path: P,
         meta_format: Option<OnDiskMetadataFormat>,
@@ -250,7 +283,7 @@ where
 
     /// Creates an [`InMemoryOnDiskCorpus`] that will not store .metadata files
     ///
-    /// Will error, if [`std::fs::create_dir_all()`] failed for `dir_path`.
+    /// Will error, if [`fs::create_dir_all()`] failed for `dir_path`.
     pub fn no_meta<P>(dir_path: P) -> Result<Self, Error>
     where
         P: AsRef<Path>,
@@ -267,7 +300,7 @@ where
     ) -> Result<Self, Error> {
         match fs::create_dir_all(dir_path) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
         Ok(InMemoryOnDiskCorpus {
@@ -281,12 +314,19 @@ where
 
     /// Sets the filename for a [`Testcase`].
     /// If an error gets returned from the corpus (i.e., file exists), we'll have to retry with a different filename.
+    /// Renaming testcases will most likely cause duplicate testcases to not be handled correctly
+    /// if testcases with the same input are not given the same filename.
+    /// Only rename when you know what you are doing.
     #[inline]
     pub fn rename_testcase(
         &self,
         testcase: &mut Testcase<I>,
         filename: String,
-    ) -> Result<(), Error> {
+        id: Option<CorpusId>,
+    ) -> Result<(), Error>
+    where
+        I: Input,
+    {
         if testcase.filename().is_some() {
             // We are renaming!
 
@@ -299,41 +339,10 @@ where
                 return Ok(());
             }
 
-            if self.locking {
-                let new_lock_filename = format!(".{new_filename}.lafl_lock");
-
-                // Try to create lock file for new testcases
-                if OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(self.dir_path.join(new_lock_filename))
-                    .is_err()
-                {
-                    *testcase.filename_mut() = Some(old_filename);
-                    return Err(Error::illegal_state(
-                        "unable to create lock file for new testcase",
-                    ));
-                }
-            }
-
             let new_file_path = self.dir_path.join(&new_filename);
-
-            fs::rename(testcase.file_path().as_ref().unwrap(), &new_file_path)?;
-
-            let new_metadata_path = {
-                if let Some(old_metadata_path) = testcase.metadata_path() {
-                    // We have metadata. Let's rename it.
-                    let new_metadata_path = self.dir_path.join(format!(".{new_filename}.metadata"));
-                    fs::rename(old_metadata_path, &new_metadata_path)?;
-
-                    Some(new_metadata_path)
-                } else {
-                    None
-                }
-            };
-
-            *testcase.metadata_path_mut() = new_metadata_path;
+            self.remove_testcase(testcase)?;
             *testcase.filename_mut() = Some(new_filename);
+            self.save_testcase(testcase, id)?;
             *testcase.file_path_mut() = Some(new_file_path);
 
             Ok(())
@@ -344,48 +353,53 @@ where
         }
     }
 
-    fn save_testcase(&self, testcase: &mut Testcase<I>, idx: CorpusId) -> Result<(), Error> {
-        let file_name_orig = testcase.filename_mut().take().unwrap_or_else(|| {
+    fn save_testcase(&self, testcase: &mut Testcase<I>, id: Option<CorpusId>) -> Result<(), Error>
+    where
+        I: Input,
+    {
+        let file_name = testcase.filename_mut().take().unwrap_or_else(|| {
             // TODO walk entry metadata to ask for pieces of filename (e.g. :havoc in AFL)
-            testcase.input().as_ref().unwrap().generate_name(idx.0)
+            testcase.input().as_ref().unwrap().generate_name(id)
         });
 
-        // New testcase, we need to save it.
-        let mut file_name = file_name_orig.clone();
+        let mut ctr = 1;
+        if self.locking {
+            let lockfile_name = format!(".{file_name}");
+            let lockfile_path = self.dir_path.join(lockfile_name);
 
-        let mut ctr = 2;
-        let file_name = if self.locking {
-            loop {
-                let lockfile_name = format!(".{file_name}.lafl_lock");
-                let lockfile_path = self.dir_path.join(lockfile_name);
-
-                if OpenOptions::new()
+            let mut lockfile = try_create_new(&lockfile_path)?.unwrap_or(
+                OpenOptions::new()
                     .write(true)
-                    .create_new(true)
-                    .open(lockfile_path)
-                    .is_ok()
-                {
-                    break file_name;
-                }
+                    .read(true)
+                    .open(&lockfile_path)?,
+            );
+            lockfile.lock_exclusive()?;
 
-                file_name = format!("{file_name_orig}-{ctr}");
-                ctr += 1;
+            let mut old_ctr = String::new();
+            lockfile.read_to_string(&mut old_ctr)?;
+            if !old_ctr.is_empty() {
+                ctr = old_ctr.trim().parse::<u32>()? + 1;
             }
-        } else {
-            file_name
-        };
 
-        if testcase
-            .file_path()
-            .as_ref()
-            .map_or(true, |path| !path.starts_with(&self.dir_path))
-        {
+            lockfile.seek(SeekFrom::Start(0))?;
+            lockfile.write_all(ctr.to_string().as_bytes())?;
+        }
+
+        if testcase.file_path().is_none() {
             *testcase.file_path_mut() = Some(self.dir_path.join(&file_name));
         }
         *testcase.filename_mut() = Some(file_name);
 
         if self.meta_format.is_some() {
-            let metafile_name = format!(".{}.metadata", testcase.filename().as_ref().unwrap());
+            let metafile_name = if self.locking {
+                format!(
+                    ".{}_{}.metadata",
+                    testcase.filename().as_ref().unwrap(),
+                    ctr
+                )
+            } else {
+                format!(".{}.metadata", testcase.filename().as_ref().unwrap())
+            };
             let metafile_path = self.dir_path.join(&metafile_name);
             let mut tmpfile_path = metafile_path.clone();
             tmpfile_path.set_file_name(format!(".{metafile_name}.tmp",));
@@ -393,40 +407,78 @@ where
             let ondisk_meta = OnDiskMetadata {
                 metadata: testcase.metadata_map(),
                 exec_time: testcase.exec_time(),
-                executions: testcase.executions(),
             };
 
             let mut tmpfile = File::create(&tmpfile_path)?;
 
+            let json_error =
+                |err| Error::serialize(format!("Failed to json-ify metadata: {err:?}"));
+
             let serialized = match self.meta_format.as_ref().unwrap() {
                 OnDiskMetadataFormat::Postcard => postcard::to_allocvec(&ondisk_meta)?,
-                OnDiskMetadataFormat::Json => serde_json::to_vec(&ondisk_meta)?,
-                OnDiskMetadataFormat::JsonPretty => serde_json::to_vec_pretty(&ondisk_meta)?,
+                OnDiskMetadataFormat::Json => {
+                    serde_json::to_vec(&ondisk_meta).map_err(json_error)?
+                }
+                OnDiskMetadataFormat::JsonPretty => {
+                    serde_json::to_vec_pretty(&ondisk_meta).map_err(json_error)?
+                }
                 #[cfg(feature = "gzip")]
-                OnDiskMetadataFormat::JsonGzip => GzipCompressor::new(0)
-                    .compress(&serde_json::to_vec_pretty(&ondisk_meta)?)?
-                    .unwrap(),
+                OnDiskMetadataFormat::JsonGzip => GzipCompressor::new()
+                    .compress(&serde_json::to_vec_pretty(&ondisk_meta).map_err(json_error)?),
             };
             tmpfile.write_all(&serialized)?;
             fs::rename(&tmpfile_path, &metafile_path)?;
             *testcase.metadata_path_mut() = Some(metafile_path);
         }
 
-        self.store_input_from(testcase)?;
+        // Only try to write the data if the counter is 1.
+        // Otherwise we already have a file with this name, and
+        // we can assume the data has already been written.
+        if ctr == 1 {
+            if let Err(err) = self.store_input_from(testcase) {
+                if self.locking {
+                    return Err(err);
+                }
+                log::error!(
+                    "An error occurred when trying to write a testcase without locking: {err}"
+                );
+            }
+        }
         Ok(())
     }
 
     fn remove_testcase(&self, testcase: &Testcase<I>) -> Result<(), Error> {
         if let Some(filename) = testcase.filename() {
+            let mut ctr = String::new();
+            if self.locking {
+                let lockfile_path = self.dir_path.join(format!(".{filename}"));
+                let mut lockfile = OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .open(&lockfile_path)?;
+
+                lockfile.lock_exclusive()?;
+                lockfile.read_to_string(&mut ctr)?;
+                ctr = ctr.trim().to_string();
+
+                if ctr == "1" {
+                    FileExt::unlock(&lockfile)?;
+                    drop(fs::remove_file(lockfile_path));
+                } else {
+                    lockfile.seek(SeekFrom::Start(0))?;
+                    lockfile.write_all(&(ctr.parse::<u32>()? - 1).to_le_bytes())?;
+                    return Ok(());
+                }
+            }
+
             fs::remove_file(self.dir_path.join(filename))?;
             if self.meta_format.is_some() {
-                fs::remove_file(self.dir_path.join(format!(".{filename}.metadata")))?;
+                if self.locking {
+                    fs::remove_file(self.dir_path.join(format!(".{filename}_{ctr}.metadata")))?;
+                } else {
+                    fs::remove_file(self.dir_path.join(format!(".{filename}.metadata")))?;
+                }
             }
-            // also try to remove the corresponding `.lafl_lock` file if it still exists
-            // (even though it shouldn't exist anymore, at this point in time)
-            drop(fs::remove_file(
-                self.dir_path.join(format!(".{filename}.lafl_lock")),
-            ));
         }
         Ok(())
     }
@@ -438,46 +490,29 @@ where
     }
 }
 
-#[cfg(feature = "python")]
-#[allow(clippy::unnecessary_fallible_conversions)]
-/// `InMemoryOnDiskCorpus` Python bindings
-pub mod pybind {
-    use alloc::string::String;
-    use std::path::PathBuf;
+#[cfg(test)]
+mod tests {
+    #[cfg(not(miri))]
+    use std::{env, fs, io::Write};
 
-    use pyo3::prelude::*;
-    use serde::{Deserialize, Serialize};
+    #[cfg(not(miri))]
+    use super::{create_new, try_create_new};
 
-    use crate::{
-        corpus::{pybind::PythonCorpus, InMemoryOnDiskCorpus},
-        inputs::BytesInput,
-    };
+    #[test]
+    #[cfg(not(miri))]
+    fn test() {
+        let tmp = env::temp_dir();
+        let path = tmp.join("testfile.tmp");
+        _ = fs::remove_file(&path);
+        let mut f = create_new(&path).unwrap();
+        f.write_all(&[0; 1]).unwrap();
 
-    #[pyclass(unsendable, name = "InMemoryOnDiskCorpus")]
-    #[allow(clippy::unsafe_derive_deserialize)]
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    /// Python class for InMemoryOnDiskCorpus
-    pub struct PythonInMemoryOnDiskCorpus {
-        /// Rust wrapped InMemoryOnDiskCorpus object
-        pub inner: InMemoryOnDiskCorpus<BytesInput>,
-    }
-
-    #[pymethods]
-    impl PythonInMemoryOnDiskCorpus {
-        #[new]
-        fn new(path: String) -> Self {
-            Self {
-                inner: InMemoryOnDiskCorpus::new(PathBuf::from(path)).unwrap(),
-            }
+        match try_create_new(&path) {
+            Ok(None) => (),
+            Ok(_) => panic!("File {path:?} did not exist even though it should have?"),
+            Err(e) => panic!("An unexpected error occurred: {e}"),
         }
-
-        fn as_corpus(slf: Py<Self>) -> PythonCorpus {
-            PythonCorpus::new_in_memory_on_disk(slf)
-        }
-    }
-    /// Register the classes to the python module
-    pub fn register(_py: Python, m: &PyModule) -> PyResult<()> {
-        m.add_class::<PythonInMemoryOnDiskCorpus>()?;
-        Ok(())
+        drop(f);
+        fs::remove_file(path).unwrap();
     }
 }

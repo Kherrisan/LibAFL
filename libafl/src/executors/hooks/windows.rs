@@ -2,13 +2,10 @@
 #[cfg(all(windows, feature = "std"))]
 pub mod windows_asan_handler {
     use alloc::string::String;
-    use core::{
-        ptr::addr_of_mut,
-        sync::atomic::{compiler_fence, Ordering},
-    };
+    use core::sync::atomic::{compiler_fence, Ordering};
 
     use windows::Win32::System::Threading::{
-        EnterCriticalSection, LeaveCriticalSection, CRITICAL_SECTION,
+        EnterCriticalSection, ExitProcess, LeaveCriticalSection, CRITICAL_SECTION,
     };
 
     use crate::{
@@ -19,22 +16,31 @@ pub mod windows_asan_handler {
         },
         feedbacks::Feedback,
         fuzzer::HasObjective,
-        inputs::UsesInput,
-        state::{HasCorpus, HasExecutions, HasSolutions},
+        inputs::Input,
+        observers::ObserversTuple,
+        state::{HasCurrentTestcase, HasExecutions, HasSolutions},
     };
 
     /// # Safety
     /// ASAN deatch handler
-    pub unsafe extern "C" fn asan_death_handler<E, EM, OF, Z>()
+    pub unsafe extern "C" fn asan_death_handler<E, EM, I, OF, S, Z>()
     where
-        E: Executor<EM, Z> + HasObservers,
-        EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
-        E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        E: Executor<EM, I, S, Z> + HasObservers,
+        E::Observers: ObserversTuple<I, S>,
+        EM: EventFirer<I, S> + EventRestarter<S>,
+        I: Input + Clone,
+        OF: Feedback<EM, I, E::Observers, S>,
+        S: HasExecutions + HasSolutions<I> + HasCurrentTestcase<I>,
+        Z: HasObjective<Objective = OF>,
     {
-        let data = addr_of_mut!(GLOBAL_STATE);
-        (*data).set_in_handler(true);
+        let data = &raw mut GLOBAL_STATE;
+        let in_handler = (*data).set_in_handler(true);
+
+        if in_handler {
+            log::error!("We crashed inside a asan death handler, but this should never happen!");
+            ExitProcess(56);
+        }
+
         // Have we set a timer_before?
         if (*data).ptp_timer.is_some() {
             /*
@@ -64,7 +70,7 @@ pub mod windows_asan_handler {
                 log::error!("Type QUIT to restart the child");
                 let mut line = String::new();
                 while line.trim() != "QUIT" {
-                    std::io::stdin().read_line(&mut line).unwrap();
+                    let _ = std::io::stdin().read_line(&mut line);
                 }
             }
 
@@ -76,16 +82,16 @@ pub mod windows_asan_handler {
                 (*data).ptp_timer = None;
             }
 
-            let state = (*data).state_mut::<E::State>();
+            let state = (*data).state_mut::<S>();
             let fuzzer = (*data).fuzzer_mut::<Z>();
             let event_mgr = (*data).event_mgr_mut::<EM>();
 
             log::error!("Child crashed!");
 
             // Make sure we don't crash in the crash handler forever.
-            let input = (*data).take_current_input::<<E::State as UsesInput>::Input>();
+            let input = (*data).take_current_input::<I>();
 
-            run_observers_and_save_state::<E, EM, OF, Z>(
+            run_observers_and_save_state::<E, EM, I, OF, S, Z>(
                 executor,
                 state,
                 input,
@@ -109,14 +115,16 @@ pub mod windows_exception_handler {
         ffi::c_void,
         mem::transmute,
         ptr,
-        ptr::addr_of_mut,
         sync::atomic::{compiler_fence, Ordering},
     };
+    #[cfg(feature = "std")]
+    use std::io::Write;
     #[cfg(feature = "std")]
     use std::panic;
 
     use libafl_bolts::os::windows_exceptions::{
-        ExceptionCode, Handler, CRASH_EXCEPTIONS, EXCEPTION_HANDLERS_SIZE, EXCEPTION_POINTERS,
+        ExceptionCode, ExceptionHandler, CRASH_EXCEPTIONS, EXCEPTION_HANDLERS_SIZE,
+        EXCEPTION_POINTERS,
     };
     use windows::Win32::System::Threading::{
         EnterCriticalSection, ExitProcess, LeaveCriticalSection, CRITICAL_SECTION,
@@ -131,8 +139,9 @@ pub mod windows_exception_handler {
         },
         feedbacks::Feedback,
         fuzzer::HasObjective,
-        inputs::UsesInput,
-        state::{HasCorpus, HasExecutions, HasSolutions, State},
+        inputs::Input,
+        observers::ObserversTuple,
+        state::{HasCurrentTestcase, HasExecutions, HasSolutions},
     };
 
     pub(crate) type HandlerFuncPtr =
@@ -145,12 +154,23 @@ pub mod windows_exception_handler {
     ) {
     }*/
 
-    impl Handler for InProcessExecutorHandlerData {
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        fn handle(&mut self, _code: ExceptionCode, exception_pointers: *mut EXCEPTION_POINTERS) {
+    impl ExceptionHandler for InProcessExecutorHandlerData {
+        /// # Safety
+        /// Will dereference `EXCEPTION_POINTERS` and access `GLOBAL_STATE`.
+        unsafe fn handle(
+            &mut self,
+            _code: ExceptionCode,
+            exception_pointers: *mut EXCEPTION_POINTERS,
+        ) {
             unsafe {
-                let data = addr_of_mut!(GLOBAL_STATE);
+                let data = &raw mut GLOBAL_STATE;
                 let in_handler = (*data).set_in_handler(true);
+
+                if in_handler {
+                    log::error!("We crashed inside a crash handler, but this should never happen!");
+                    ExitProcess(56);
+                }
+
                 if !(*data).crash_handler.is_null() {
                     let func: HandlerFuncPtr = transmute((*data).crash_handler);
                     (func)(exception_pointers, data);
@@ -171,18 +191,26 @@ pub mod windows_exception_handler {
     /// # Safety
     /// Well, exception handling is not safe
     #[cfg(feature = "std")]
-    pub fn setup_panic_hook<E, EM, OF, Z>()
+    pub fn setup_panic_hook<E, EM, I, OF, S, Z>()
     where
-        E: HasObservers,
-        EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
-        E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        E: Executor<EM, I, S, Z> + HasObservers,
+        E::Observers: ObserversTuple<I, S>,
+        EM: EventFirer<I, S> + EventRestarter<S>,
+        I: Input + Clone,
+        OF: Feedback<EM, I, E::Observers, S>,
+        S: HasExecutions + HasSolutions<I> + HasCurrentTestcase<I>,
+        Z: HasObjective<Objective = OF>,
     {
         let old_hook = panic::take_hook();
         panic::set_hook(Box::new(move |panic_info| unsafe {
-            let data = addr_of_mut!(GLOBAL_STATE);
+            let data = &raw mut GLOBAL_STATE;
             let in_handler = (*data).set_in_handler(true);
+
+            if in_handler {
+                log::error!("We crashed inside a crash handler, but this should never happen!");
+                ExitProcess(56);
+            }
+
             // Have we set a timer_before?
             if (*data).ptp_timer.is_some() {
                 /*
@@ -202,13 +230,13 @@ pub mod windows_exception_handler {
             if (*data).is_valid() {
                 // We are fuzzing!
                 let executor = (*data).executor_mut::<E>();
-                let state = (*data).state_mut::<E::State>();
+                let state = (*data).state_mut::<S>();
                 let fuzzer = (*data).fuzzer_mut::<Z>();
                 let event_mgr = (*data).event_mgr_mut::<EM>();
 
-                let input = (*data).take_current_input::<<E::State as UsesInput>::Input>();
+                let input = (*data).take_current_input::<I>();
 
-                run_observers_and_save_state::<E, EM, OF, Z>(
+                run_observers_and_save_state::<E, EM, I, OF, S, Z>(
                     executor,
                     state,
                     input,
@@ -228,16 +256,18 @@ pub mod windows_exception_handler {
     ///
     /// # Safety
     /// Well, exception handling is not safe
-    pub unsafe extern "system" fn inproc_timeout_handler<E, EM, OF, Z>(
+    pub unsafe extern "system" fn inproc_timeout_handler<E, EM, I, OF, S, Z>(
         _p0: *mut u8,
         global_state: *mut c_void,
         _p1: *mut u8,
     ) where
-        E: HasObservers + HasInProcessHooks,
-        EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
-        E::State: State + HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        E: Executor<EM, I, S, Z> + HasInProcessHooks<I, S> + HasObservers,
+        E::Observers: ObserversTuple<I, S>,
+        EM: EventFirer<I, S> + EventRestarter<S>,
+        I: Input + Clone,
+        OF: Feedback<EM, I, E::Observers, S>,
+        S: HasExecutions + HasSolutions<I> + HasCurrentTestcase<I>,
+        Z: HasObjective<Objective = OF>,
     {
         let data: &mut InProcessExecutorHandlerData =
             &mut *(global_state as *mut InProcessExecutorHandlerData);
@@ -260,7 +290,7 @@ pub mod windows_exception_handler {
 
         if data.in_target == 1 {
             let executor = data.executor_mut::<E>();
-            let state = data.state_mut::<E::State>();
+            let state = data.state_mut::<S>();
             let fuzzer = data.fuzzer_mut::<Z>();
             let event_mgr = data.event_mgr_mut::<EM>();
 
@@ -269,12 +299,10 @@ pub mod windows_exception_handler {
             } else {
                 log::error!("Timeout in fuzz run.");
 
-                let input = (data.current_input_ptr as *const <E::State as UsesInput>::Input)
-                    .as_ref()
-                    .unwrap();
+                let input = (data.current_input_ptr as *const I).as_ref().unwrap();
                 data.current_input_ptr = ptr::null_mut();
 
-                run_observers_and_save_state::<E, EM, OF, Z>(
+                run_observers_and_save_state::<E, EM, I, OF, S, Z>(
                     executor,
                     state,
                     input,
@@ -298,16 +326,17 @@ pub mod windows_exception_handler {
     ///
     /// # Safety
     /// Well, exception handling is not safe
-    #[allow(clippy::too_many_lines)]
-    pub unsafe fn inproc_crash_handler<E, EM, OF, Z>(
+    pub unsafe fn inproc_crash_handler<E, EM, I, OF, S, Z>(
         exception_pointers: *mut EXCEPTION_POINTERS,
         data: &mut InProcessExecutorHandlerData,
     ) where
-        E: Executor<EM, Z> + HasObservers,
-        EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
-        E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        E: Executor<EM, I, S, Z> + HasObservers,
+        E::Observers: ObserversTuple<I, S>,
+        EM: EventFirer<I, S> + EventRestarter<S>,
+        I: Input + Clone,
+        OF: Feedback<EM, I, E::Observers, S>,
+        S: HasExecutions + HasSolutions<I> + HasCurrentTestcase<I>,
+        Z: HasObjective<Objective = OF>,
     {
         // Have we set a timer_before?
         if data.ptp_timer.is_some() {
@@ -329,26 +358,33 @@ pub mod windows_exception_handler {
         let mut is_crash = true;
         #[cfg(feature = "std")]
         if let Some(exception_pointers) = exception_pointers.as_mut() {
-            let code = ExceptionCode::try_from(
+            let code: ExceptionCode = ExceptionCode::from(
                 exception_pointers
                     .ExceptionRecord
                     .as_mut()
                     .unwrap()
                     .ExceptionCode
                     .0,
-            )
-            .unwrap();
+            );
 
             let exception_list = data.exceptions();
             if exception_list.contains(&code) {
-                log::error!("Crashed with {code}");
+                log::error!(
+                    "Crashed with {code} at {:?} in thread {:?}",
+                    exception_pointers
+                        .ExceptionRecord
+                        .as_mut()
+                        .unwrap()
+                        .ExceptionAddress,
+                    winapi::um::processthreadsapi::GetCurrentThreadId()
+                );
             } else {
                 // log::trace!("Exception code received, but {code} is not in CRASH_EXCEPTIONS");
                 is_crash = false;
             }
         } else {
             log::error!("Crashed without exception (probably due to SIGABRT)");
-        };
+        }
 
         if data.current_input_ptr.is_null() {
             {
@@ -370,7 +406,7 @@ pub mod windows_exception_handler {
                 log::error!("Type QUIT to restart the child");
                 let mut line = String::new();
                 while line.trim() != "QUIT" {
-                    std::io::stdin().read_line(&mut line).unwrap();
+                    let _ = std::io::stdin().read_line(&mut line);
                 }
             }
 
@@ -382,7 +418,7 @@ pub mod windows_exception_handler {
                 data.ptp_timer = None;
             }
 
-            let state = data.state_mut::<E::State>();
+            let state = data.state_mut::<S>();
             let fuzzer = data.fuzzer_mut::<Z>();
             let event_mgr = data.event_mgr_mut::<EM>();
 
@@ -394,9 +430,10 @@ pub mod windows_exception_handler {
 
             // Make sure we don't crash in the crash handler forever.
             if is_crash {
-                let input = data.take_current_input::<<E::State as UsesInput>::Input>();
-
-                run_observers_and_save_state::<E, EM, OF, Z>(
+                log::warn!("Running observers and exiting!");
+                // // I want to disable the hooks before doing anything, especially before taking a stack dump
+                let input = data.take_current_input::<I>(); // log::set_max_level(log::LevelFilter::Trace);
+                run_observers_and_save_state::<E, EM, I, OF, S, Z>(
                     executor,
                     state,
                     input,
@@ -404,6 +441,17 @@ pub mod windows_exception_handler {
                     event_mgr,
                     ExitKind::Crash,
                 );
+                {
+                    let mut bsod = Vec::new();
+                    {
+                        let mut writer = std::io::BufWriter::new(&mut bsod);
+                        writeln!(writer, "input: {:?}", input.generate_name(None)).unwrap();
+                        libafl_bolts::minibsod::generate_minibsod(&mut writer, exception_pointers)
+                            .unwrap();
+                        writer.flush().unwrap();
+                    }
+                    log::error!("{}", std::str::from_utf8(&bsod).unwrap());
+                }
             } else {
                 // This is not worth saving
             }

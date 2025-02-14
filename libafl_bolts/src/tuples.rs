@@ -1,52 +1,30 @@
 //! Compiletime lists/tuples used throughout the `LibAFL` universe
 
-#[rustversion::not(nightly)]
-use core::any::type_name;
+#[cfg(feature = "alloc")]
+use alloc::{borrow::Cow, vec::Vec};
+#[cfg(feature = "alloc")]
 use core::{
-    any::TypeId,
-    ptr::{addr_of, addr_of_mut},
+    any::type_name,
+    fmt::{Debug, Formatter},
+    marker::PhantomData,
+    ops::{Deref, DerefMut, Index, IndexMut},
 };
+use core::{any::TypeId, mem::transmute};
 
+#[cfg(feature = "alloc")]
+use serde::{Deserialize, Serialize};
 pub use tuple_list::{tuple_list, tuple_list_type, TupleList};
 
 #[cfg(any(feature = "xxh3", feature = "alloc"))]
 use crate::hash_std;
-use crate::{HasLen, Named};
+use crate::HasLen;
+#[cfg(feature = "alloc")]
+use crate::Named;
 
-/// Returns if the type `T` is equal to `U`
-/// From <https://stackoverflow.com/a/60138532/7658998>
-#[rustversion::nightly]
-#[inline]
-#[must_use]
-pub const fn type_eq<T: ?Sized, U: ?Sized>() -> bool {
-    // Helper trait. `VALUE` is false, except for the specialization of the
-    // case where `T == U`.
-    trait TypeEq<U: ?Sized> {
-        const VALUE: bool;
-    }
-
-    // Default implementation.
-    impl<T: ?Sized, U: ?Sized> TypeEq<U> for T {
-        default const VALUE: bool = false;
-    }
-
-    // Specialization for `T == U`.
-    impl<T: ?Sized> TypeEq<T> for T {
-        const VALUE: bool = true;
-    }
-
-    <T as TypeEq<U>>::VALUE
-}
-
-/// Returns if the type `T` is equal to `U`
-/// As this relies on [`type_name`](https://doc.rust-lang.org/std/any/fn.type_name.html#note) internally,
-/// there is a chance for collisions.
-/// Use `nightly` if you need a perfect match at all times.
-#[rustversion::not(nightly)]
-#[inline]
+/// Returns if the type `T` is equal to `U`, ignoring lifetimes.
 #[must_use]
 pub fn type_eq<T: ?Sized, U: ?Sized>() -> bool {
-    type_name::<T>() == type_name::<U>()
+    typeid::of::<T>() == typeid::of::<U>()
 }
 
 /// Borrow each member of the tuple
@@ -88,6 +66,33 @@ where
     }
 }
 
+/// Create a [`Vec`] from a tuple list or similar
+/// (We need this trait since we cannot implement `Into` for foreign types)
+#[cfg(feature = "alloc")]
+pub trait IntoVec<T> {
+    /// Convert this into a [`Vec`], reversed.
+    /// (Having this method around makes some implementations more performant)
+    fn into_vec_reversed(self) -> Vec<T>
+    where
+        Self: Sized,
+    {
+        let mut ret = self.into_vec();
+        ret.reverse();
+        ret
+    }
+
+    /// Convert this into a [`Vec`].
+    fn into_vec(self) -> Vec<T>;
+}
+
+#[cfg(feature = "alloc")]
+impl<T> IntoVec<T> for () {
+    #[inline]
+    fn into_vec(self) -> Vec<T> {
+        Vec::new()
+    }
+}
+
 /// Gets the length of the element
 pub trait HasConstLen {
     /// The length as constant `usize`
@@ -105,16 +110,30 @@ where
     const LEN: usize = 1 + Tail::LEN;
 }
 
-impl<C> HasLen for C
+impl<Head, Tail> HasLen for (Head, Tail)
 where
-    C: HasConstLen,
+    Tail: HasLen,
 {
+    #[inline]
     fn len(&self) -> usize {
-        Self::LEN
+        self.1.len() + 1
     }
+}
 
-    fn is_empty(&self) -> bool {
-        Self::LEN != 0
+impl<Tail> HasLen for (Tail,)
+where
+    Tail: HasLen,
+{
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl HasLen for () {
+    #[inline]
+    fn len(&self) -> usize {
+        0
     }
 }
 
@@ -172,9 +191,9 @@ where
 
 /// Returns the first element with the given type
 pub trait MatchFirstType {
-    /// Returns the first element with the given type as borrow, or [`Option::None`]
+    /// Returns the first element with the given type as borrow, or [`None`]
     fn match_first_type<T: 'static>(&self) -> Option<&T>;
-    /// Returns the first element with the given type as mutable borrow, or [`Option::None`]
+    /// Returns the first element with the given type as mutable borrow, or [`None`]
     fn match_first_type_mut<T: 'static>(&mut self) -> Option<&mut T>;
 }
 
@@ -194,7 +213,7 @@ where
 {
     fn match_first_type<T: 'static>(&self) -> Option<&T> {
         if TypeId::of::<T>() == TypeId::of::<Head>() {
-            unsafe { (addr_of!(self.0) as *const T).as_ref() }
+            unsafe { (&raw const self.0 as *const T).as_ref() }
         } else {
             self.1.match_first_type::<T>()
         }
@@ -202,7 +221,7 @@ where
 
     fn match_first_type_mut<T: 'static>(&mut self) -> Option<&mut T> {
         if TypeId::of::<T>() == TypeId::of::<Head>() {
-            unsafe { (addr_of_mut!(self.0) as *mut T).as_mut() }
+            unsafe { (&raw mut self.0 as *mut T).as_mut() }
         } else {
             self.1.match_first_type_mut::<T>()
         }
@@ -211,7 +230,7 @@ where
 
 /// Returns the first element with the given type (dereference mut version)
 pub trait ExtractFirstRefType {
-    /// Returns the first element with the given type as borrow, or [`Option::None`]
+    /// Returns the first element with the given type as borrow, or [`None`]
     fn take<'a, T: 'static>(self) -> (Option<&'a T>, Self);
 }
 
@@ -229,7 +248,7 @@ where
     fn take<'a, T: 'static>(mut self) -> (Option<&'a T>, Self) {
         if TypeId::of::<T>() == TypeId::of::<Head>() {
             let r = self.0.take();
-            (unsafe { core::mem::transmute(r) }, self)
+            (unsafe { transmute::<Option<&Head>, Option<&T>>(r) }, self)
         } else {
             let (r, tail) = self.1.take::<T>();
             (r, (self.0, tail))
@@ -245,7 +264,10 @@ where
     fn take<'a, T: 'static>(mut self) -> (Option<&'a T>, Self) {
         if TypeId::of::<T>() == TypeId::of::<Head>() {
             let r = self.0.take();
-            (unsafe { core::mem::transmute(r) }, self)
+            (
+                unsafe { transmute::<Option<&mut Head>, Option<&T>>(r) },
+                self,
+            )
         } else {
             let (r, tail) = self.1.take::<T>();
             (r, (self.0, tail))
@@ -255,7 +277,7 @@ where
 
 /// Returns the first element with the given type (dereference mut version)
 pub trait ExtractFirstRefMutType {
-    /// Returns the first element with the given type as borrow, or [`Option::None`]
+    /// Returns the first element with the given type as borrow, or [`None`]
     fn take<'a, T: 'static>(self) -> (Option<&'a mut T>, Self);
 }
 
@@ -273,7 +295,10 @@ where
     fn take<'a, T: 'static>(mut self) -> (Option<&'a mut T>, Self) {
         if TypeId::of::<T>() == TypeId::of::<Head>() {
             let r = self.0.take();
-            (unsafe { core::mem::transmute(r) }, self)
+            (
+                unsafe { transmute::<Option<&mut Head>, Option<&mut T>>(r) },
+                self,
+            )
         } else {
             let (r, tail) = self.1.take::<T>();
             (r, (self.0, tail))
@@ -343,7 +368,7 @@ where
     fn match_type<T: 'static, FN: FnMut(&T)>(&self, f: &mut FN) {
         // Switch this check to https://stackoverflow.com/a/60138532/7658998 when in stable and remove 'static
         if TypeId::of::<T>() == TypeId::of::<Head>() {
-            f(unsafe { (addr_of!(self.0) as *const T).as_ref() }.unwrap());
+            f(unsafe { (&raw const self.0 as *const T).as_ref() }.unwrap());
         }
         self.1.match_type::<T, FN>(f);
     }
@@ -351,57 +376,76 @@ where
     fn match_type_mut<T: 'static, FN: FnMut(&mut T)>(&mut self, f: &mut FN) {
         // Switch this check to https://stackoverflow.com/a/60138532/7658998 when in stable and remove 'static
         if TypeId::of::<T>() == TypeId::of::<Head>() {
-            f(unsafe { (addr_of_mut!(self.0) as *mut T).as_mut() }.unwrap());
+            f(unsafe { (&raw mut self.0 as *mut T).as_mut() }.unwrap());
         }
         self.1.match_type_mut::<T, FN>(f);
     }
 }
 
+#[cfg(feature = "alloc")]
 /// A named tuple
 pub trait NamedTuple: HasConstLen {
     /// Gets the name of this tuple
-    fn name(&self, index: usize) -> Option<&str>;
+    fn name(&self, index: usize) -> Option<&Cow<'static, str>>;
+
+    /// Gets all the names
+    fn names(&self) -> Vec<Cow<'static, str>>;
 }
 
+#[cfg(feature = "alloc")]
 impl NamedTuple for () {
-    fn name(&self, _index: usize) -> Option<&str> {
+    fn name(&self, _index: usize) -> Option<&Cow<'static, str>> {
         None
     }
-}
 
-impl Named for () {
-    #[inline]
-    fn name(&self) -> &str {
-        "Empty"
+    fn names(&self) -> Vec<Cow<'static, str>> {
+        Vec::new()
     }
 }
 
+#[cfg(feature = "alloc")]
+impl Named for () {
+    #[inline]
+    fn name(&self) -> &Cow<'static, str> {
+        static NAME: Cow<'static, str> = Cow::Borrowed("Empty");
+        &NAME
+    }
+}
+
+#[cfg(feature = "alloc")]
 impl<Head, Tail> NamedTuple for (Head, Tail)
 where
     Head: Named,
     Tail: NamedTuple,
 {
-    fn name(&self, index: usize) -> Option<&str> {
+    fn name(&self, index: usize) -> Option<&Cow<'static, str>> {
         if index == 0 {
             Some(self.0.name())
         } else {
             self.1.name(index - 1)
         }
     }
+
+    fn names(&self) -> Vec<Cow<'static, str>> {
+        let first = self.0.name().clone();
+        let mut last = self.1.names();
+        last.insert(0, first);
+        last
+    }
 }
 
 /// Match for a name and return the value
-///
-/// # Note
-/// This operation may not be 100% accurate with Rust stable, see the notes for [`type_eq`]
-/// (in `nightly`, it uses [specialization](https://stackoverflow.com/a/60138532/7658998)).
+#[cfg(feature = "alloc")]
 pub trait MatchName {
     /// Match for a name and return the borrowed value
+    #[deprecated = "Use `.reference` and either `.get` (fallible access) or `[]` (infallible access) instead"]
     fn match_name<T>(&self, name: &str) -> Option<&T>;
     /// Match for a name and return the mut borrowed value
+    #[deprecated = "Use `.reference` and either `.get` (fallible access) or `[]` (infallible access) instead"]
     fn match_name_mut<T>(&mut self, name: &str) -> Option<&mut T>;
 }
 
+#[cfg(feature = "alloc")]
 impl MatchName for () {
     fn match_name<T>(&self, _name: &str) -> Option<&T> {
         None
@@ -411,6 +455,8 @@ impl MatchName for () {
     }
 }
 
+#[cfg(feature = "alloc")]
+#[expect(deprecated)]
 impl<Head, Tail> MatchName for (Head, Tail)
 where
     Head: Named,
@@ -418,7 +464,7 @@ where
 {
     fn match_name<T>(&self, name: &str) -> Option<&T> {
         if type_eq::<Head, T>() && name == self.0.name() {
-            unsafe { (addr_of!(self.0) as *const T).as_ref() }
+            unsafe { (&raw const self.0 as *const T).as_ref() }
         } else {
             self.1.match_name::<T>(name)
         }
@@ -426,104 +472,200 @@ where
 
     fn match_name_mut<T>(&mut self, name: &str) -> Option<&mut T> {
         if type_eq::<Head, T>() && name == self.0.name() {
-            unsafe { (addr_of_mut!(self.0) as *mut T).as_mut() }
+            unsafe { (&raw mut self.0 as *mut T).as_mut() }
         } else {
             self.1.match_name_mut::<T>(name)
         }
     }
 }
 
-/// Finds an element of a `type` by the given `name`.
-pub trait MatchNameAndType {
-    /// Finds an element of a `type` by the given `name`, and returns a borrow, or [`Option::None`].
-    fn match_name_type<T: 'static>(&self, name: &str) -> Option<&T>;
-    /// Finds an element of a `type` by the given `name`, and returns a mut borrow, or [`Option::None`].
-    fn match_name_type_mut<T: 'static>(&mut self, name: &str) -> Option<&mut T>;
-}
-
-impl MatchNameAndType for () {
-    fn match_name_type<T: 'static>(&self, _name: &str) -> Option<&T> {
-        None
-    }
-    fn match_name_type_mut<T: 'static>(&mut self, _name: &str) -> Option<&mut T> {
-        None
+/// Structs that have a [`Handle`] to reference this element by, in maps.
+/// You should use this when you want to avoid specifying types.
+#[cfg(feature = "alloc")]
+pub trait Handled: Named {
+    /// Return the [`Handle`]
+    fn handle(&self) -> Handle<Self> {
+        Handle {
+            name: Named::name(self).clone(),
+            phantom: PhantomData,
+        }
     }
 }
 
-impl<Head, Tail> MatchNameAndType for (Head, Tail)
+#[cfg(feature = "alloc")]
+impl<N> Handled for N where N: Named {}
+
+/// Object with the type T and the name associated with its concrete value
+#[derive(Serialize, Deserialize)]
+#[cfg(feature = "alloc")]
+pub struct Handle<T: ?Sized> {
+    name: Cow<'static, str>,
+    #[serde(skip)]
+    phantom: PhantomData<T>,
+}
+
+#[cfg(feature = "alloc")]
+impl<T: ?Sized> Handle<T> {
+    /// Create a new [`Handle`] with the given name.
+    #[must_use]
+    pub fn new(name: Cow<'static, str>) -> Self {
+        Self {
+            name,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Fetch the name of the referenced instance.
+    ///
+    /// We explicitly do *not* implement [`Named`], as this could potentially lead to confusion
+    /// where we make a [`Handle`] of a [`Handle`] as [`Named`] is blanket implemented.
+    #[must_use]
+    pub fn name(&self) -> &Cow<'static, str> {
+        &self.name
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            phantom: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T> Debug for Handle<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Handle")
+            .field("name", self.name())
+            .field("type", &type_name::<T>())
+            .finish()
+    }
+}
+
+/// Search using `Handle `
+#[cfg(feature = "alloc")]
+pub trait MatchNameRef {
+    /// Search using name and `Handle `
+    fn get<T>(&self, rf: &Handle<T>) -> Option<&T>;
+
+    /// Search using name and `Handle `
+    fn get_mut<T>(&mut self, rf: &Handle<T>) -> Option<&mut T>;
+}
+
+#[cfg(feature = "alloc")]
+#[expect(deprecated)]
+impl<M> MatchNameRef for M
 where
-    Head: 'static + Named,
-    Tail: MatchNameAndType,
+    M: MatchName,
 {
-    fn match_name_type<T: 'static>(&self, name: &str) -> Option<&T> {
-        // Switch this check to https://stackoverflow.com/a/60138532/7658998 when in stable and remove 'static
-        if TypeId::of::<T>() == TypeId::of::<Head>() && name == self.0.name() {
-            unsafe { (addr_of!(self.0) as *const T).as_ref() }
-        } else {
-            self.1.match_name_type::<T>(name)
-        }
+    fn get<T>(&self, rf: &Handle<T>) -> Option<&T> {
+        self.match_name::<T>(&rf.name)
     }
 
-    fn match_name_type_mut<T: 'static>(&mut self, name: &str) -> Option<&mut T> {
-        // Switch this check to https://stackoverflow.com/a/60138532/7658998 when in stable and remove 'static
-        if TypeId::of::<T>() == TypeId::of::<Head>() && name == self.0.name() {
-            unsafe { (addr_of_mut!(self.0) as *mut T).as_mut() }
-        } else {
-            self.1.match_name_type_mut::<T>(name)
-        }
+    fn get_mut<T>(&mut self, rf: &Handle<T>) -> Option<&mut T> {
+        self.match_name_mut::<T>(&rf.name)
+    }
+}
+
+/// A wrapper type to enable the indexing of [`MatchName`] implementors with `[]`.
+#[cfg(feature = "alloc")]
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+pub struct RefIndexable<RM, M>(RM, PhantomData<M>);
+
+#[cfg(feature = "alloc")]
+impl<RM, M> From<RM> for RefIndexable<RM, M>
+where
+    RM: Deref<Target = M>,
+{
+    fn from(value: RM) -> Self {
+        RefIndexable(value, PhantomData)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<RM, M> Deref for RefIndexable<RM, M>
+where
+    RM: Deref<Target = M>,
+{
+    type Target = RM::Target;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<RM, M> DerefMut for RefIndexable<RM, M>
+where
+    RM: DerefMut<Target = M>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T, RM, M> Index<&Handle<T>> for RefIndexable<RM, M>
+where
+    RM: Deref<Target = M>,
+    M: MatchName,
+{
+    type Output = T;
+
+    fn index(&self, index: &Handle<T>) -> &Self::Output {
+        let Some(e) = self.get(index) else {
+            panic!("Could not find entry matching {index:?}")
+        };
+        e
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T, RM, M> IndexMut<&Handle<T>> for RefIndexable<RM, M>
+where
+    RM: DerefMut<Target = M>,
+    M: MatchName,
+{
+    fn index_mut(&mut self, index: &Handle<T>) -> &mut Self::Output {
+        let Some(e) = self.get_mut(index) else {
+            panic!("Could not find entry matching {index:?}")
+        };
+        e
     }
 }
 
 /// Allows prepending of values to a tuple
 pub trait Prepend<T> {
-    /// The Resulting [`TupleList`], of an [`Prepend::prepend()`] call,
-    /// including the prepended entry.
-    type PreprendResult;
-
     /// Prepend a value to this tuple, returning a new tuple with prepended value.
     #[must_use]
-    fn prepend(self, value: T) -> (T, Self::PreprendResult);
+    fn prepend(self, value: T) -> (T, Self);
 }
 
 /// Implement prepend for tuple list.
 impl<Tail, T> Prepend<T> for Tail {
-    type PreprendResult = Self;
-
-    fn prepend(self, value: T) -> (T, Self::PreprendResult) {
+    fn prepend(self, value: T) -> (T, Self) {
         (value, self)
     }
 }
 
 /// Append to a tuple
-pub trait Append<T> {
-    /// The Resulting [`TupleList`], of an [`Append::append()`] call,
-    /// including the appended entry.
-    type AppendResult;
-
+pub trait Append<T>
+where
+    Self: Sized,
+{
     /// Append Value and return the tuple
     #[must_use]
-    fn append(self, value: T) -> Self::AppendResult;
+    fn append(self, value: T) -> (Self, T);
 }
 
-/// Implement append for an empty tuple list.
-impl<T> Append<T> for () {
-    type AppendResult = (T, ());
-
-    fn append(self, value: T) -> Self::AppendResult {
-        (value, ())
-    }
-}
-
-/// Implement append for non-empty tuple list.
-impl<Head, Tail, T> Append<T> for (Head, Tail)
-where
-    Tail: Append<T>,
-{
-    type AppendResult = (Head, Tail::AppendResult);
-
-    fn append(self, value: T) -> Self::AppendResult {
-        let (head, tail) = self;
-        (head, tail.append(value))
+/// Implement append for tuple list.
+impl<Head, T> Append<T> for Head {
+    fn append(self, value: T) -> (Self, T) {
+        (self, value)
     }
 }
 
@@ -559,12 +701,47 @@ where
     }
 }
 
+/// Trait for structs which are capable of mapping a given type to another.
+pub trait MappingFunctor<T> {
+    /// The result of the mapping operation.
+    type Output;
+
+    /// The actual mapping operation.
+    fn apply(&mut self, from: T) -> Self::Output;
+}
+
+/// Map all entries in a tuple to another type, dependent on the tail type.
+pub trait Map<M> {
+    /// The result of the mapping operation.
+    type MapResult;
+
+    /// Perform the mapping!
+    fn map(self, mapper: M) -> Self::MapResult;
+}
+
+impl<Head, Tail, M> Map<M> for (Head, Tail)
+where
+    M: MappingFunctor<Head>,
+    Tail: Map<M>,
+{
+    type MapResult = (M::Output, Tail::MapResult);
+
+    fn map(self, mut mapper: M) -> Self::MapResult {
+        let head = mapper.apply(self.0);
+        (head, self.1.map(mapper))
+    }
+}
+
+impl<M> Map<M> for () {
+    type MapResult = ();
+
+    fn map(self, _mapper: M) -> Self::MapResult {}
+}
+
 /// Iterate over a tuple, executing the given `expr` for each element.
 #[macro_export]
-#[allow(clippy::items_after_statements)]
 macro_rules! tuple_for_each {
     ($fn_name:ident, $trait_name:path, $tuple_name:ident, $body:expr) => {
-        #[allow(clippy::items_after_statements)]
         mod $fn_name {
             pub trait ForEach {
                 fn for_each(&self);
@@ -579,7 +756,7 @@ macro_rules! tuple_for_each {
                 Head: $trait_name,
                 Tail: tuple_list::TupleList + ForEach,
             {
-                #[allow(clippy::redundant_closure_call)]
+                #[allow(clippy::redundant_closure_call)] // macro may be called on a closure or a function
                 fn for_each(&self) {
                     ($body)(&self.0);
                     self.1.for_each();
@@ -598,7 +775,6 @@ macro_rules! tuple_for_each {
 #[macro_export]
 macro_rules! tuple_for_each_mut {
     ($fn_name:ident, $trait_name:path, $tuple_name:ident, $body:expr) => {
-        #[allow(clippy::items_after_statements)]
         mod $fn_name {
             pub trait ForEachMut {
                 fn for_each_mut(&mut self);
@@ -613,7 +789,7 @@ macro_rules! tuple_for_each_mut {
                 Head: $trait_name,
                 Tail: tuple_list::TupleList + ForEachMut,
             {
-                #[allow(clippy::redundant_closure_call)]
+                #[allow(clippy::redundant_closure_call)] // macro may be called on a closure or a function
                 fn for_each_mut(&mut self) {
                     ($body)(&mut self.0);
                     self.1.for_each_mut();
@@ -628,20 +804,79 @@ macro_rules! tuple_for_each_mut {
     };
 }
 
-#[cfg(test)]
-#[cfg(feature = "std")]
-#[test]
-#[allow(clippy::items_after_statements)]
-pub fn test_macros() {
-    let mut t = tuple_list!(1, "a");
+/// Maps the types of a mapping with a [`MappingFunctor`]
+///
+/// ```rust
+/// use libafl_bolts::{
+///     map_tuple_list_type,
+///     tuples::{MappingFunctor, Map, tuple_list, tuple_list_type}
+/// };
+///
+/// struct Wrapper<T>(T);
+/// struct MyMapper;
+///
+/// impl<T> MappingFunctor<T> for MyMapper {
+///     type Output = Wrapper<T>;
+///
+///     fn apply(&mut self, from: T) -> <Self as MappingFunctor<T>>::Output {
+///         Wrapper(from)
+///     }
+/// }
+///
+/// struct A;
+/// struct B;
+/// struct C;
+///
+/// type OrigType = tuple_list_type!(A, B, C);
+/// type MappedType = map_tuple_list_type!(OrigType, MyMapper);
+/// let orig: OrigType = tuple_list!(A, B, C);
+/// let _mapped: MappedType = orig.map(MyMapper);
+/// ```
+#[macro_export]
+macro_rules! map_tuple_list_type {
+    ($Tuple:ty, $Mapper:ty) => {
+        <$Tuple as $crate::tuples::Map<$Mapper>>::MapResult
+    };
+}
 
-    tuple_for_each!(f1, std::fmt::Display, t, |x| {
-        log::info!("{x}");
-    });
+/// Merges the types of two merged [`tuple_list!`]s
+///
+/// ```rust
+/// use libafl_bolts::{merge_tuple_list_type, tuples::{Merge, tuple_list, tuple_list_type}};
+///
+/// struct A;
+/// struct B;
+/// struct C;
+/// struct D;
+/// struct E;
+///
+/// type Lhs = tuple_list_type!(A, B, C);
+/// type Rhs = tuple_list_type!(D, E);
+/// type Merged = merge_tuple_list_type!(Lhs, Rhs);
+///
+/// let lhs: Lhs = tuple_list!(A, B, C);
+/// let rhs: Rhs = tuple_list!(D, E);
+/// let _merged: Merged = lhs.merge(rhs);
+/// ```
+#[macro_export]
+macro_rules! merge_tuple_list_type {
+   // Base case: when only two types are provided, apply the Merge trait directly
+   ($Type1:ty) => {
+        $Type1
+    };
 
-    tuple_for_each_mut!(f2, std::fmt::Display, t, |x| {
-        log::info!("{x}");
-    });
+   // Base case: when only two types are provided, apply the Merge trait directly
+   ($Type1:ty, $Type2:ty) => {
+        <$Type1 as $crate::tuples::Merge<$Type2>>::MergeResult
+    };
+
+    // Recursive case: when more than two types are provided
+    ($Type1:ty, $Type2:ty, $( $rest:ty ),+) => {
+        merge_tuple_list_type!(
+            <$Type1 as $crate::tuples::Merge<$Type2>>::MergeResult,
+            $( $rest ),+
+        )
+    };
 }
 
 /*
@@ -675,12 +910,16 @@ impl<Head, Tail> PlusOne for (Head, Tail) where
 
 #[cfg(test)]
 mod test {
+    use core::marker::PhantomData;
+
+    use tuple_list::{tuple_list, tuple_list_type};
+
     #[cfg(feature = "alloc")]
     use crate::ownedref::OwnedMutSlice;
-    use crate::tuples::type_eq;
+    use crate::tuples::{type_eq, Map, MappingFunctor, Merge};
 
     #[test]
-    #[allow(unused_qualifications)] // for type name tests
+    // for type name tests
     fn test_type_eq_simple() {
         // test eq
         assert!(type_eq::<u64, u64>());
@@ -690,14 +929,12 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "alloc")]
-    #[allow(unused_qualifications)] // for type name tests
     fn test_type_eq() {
         // An alias for equality testing
         type OwnedMutSliceAlias<'a> = OwnedMutSlice<'a, u8>;
 
         // A function for lifetime testing
-        #[allow(clippy::extra_unused_lifetimes)]
+        #[expect(clippy::extra_unused_lifetimes)]
         fn test_lifetimes<'a, 'b>() {
             assert!(type_eq::<OwnedMutSlice<'a, u8>, OwnedMutSlice<'b, u8>>());
             assert!(type_eq::<OwnedMutSlice<'static, u8>, OwnedMutSlice<'a, u8>>());
@@ -711,14 +948,75 @@ mod test {
         // test weirder lifetime things
         assert!(type_eq::<OwnedMutSlice<u8>, OwnedMutSlice<u8>>());
         assert!(!type_eq::<OwnedMutSlice<u8>, OwnedMutSlice<u32>>());
+    }
 
-        assert!(type_eq::<
-            OwnedMutSlice<u8>,
-            crate::ownedref::OwnedMutSlice<u8>,
-        >());
-        assert!(!type_eq::<
-            OwnedMutSlice<u8>,
-            crate::ownedref::OwnedMutSlice<u32>,
-        >());
+    #[test]
+    fn test_mapper() {
+        struct W<T>(T);
+
+        // PhantomData shows how to deal with mappers that have generics
+        struct ExampleMapper<P>(PhantomData<P>);
+
+        impl<T, P> MappingFunctor<T> for ExampleMapper<P> {
+            type Output = W<T>;
+
+            fn apply(&mut self, from: T) -> Self::Output {
+                W(from)
+            }
+        }
+
+        struct A;
+        struct B;
+        struct C;
+
+        type OrigType = tuple_list_type!(A, B, C);
+        type MappedType = map_tuple_list_type!(OrigType, ExampleMapper<usize>);
+        let orig: OrigType = tuple_list!(A, B, C);
+        let _mapped: MappedType = orig.map(ExampleMapper(PhantomData::<usize>));
+    }
+
+    #[test]
+    fn test_merge() {
+        struct A;
+        struct B;
+        struct C;
+        struct D;
+        struct E;
+
+        type Lhs = tuple_list_type!(A, B, C);
+        type Rhs = tuple_list_type!(D, E);
+        type Merged = merge_tuple_list_type!(Lhs, Rhs);
+        type IndividuallyMergedPre = merge_tuple_list_type!(
+            tuple_list_type!(A),
+            tuple_list_type!(B),
+            tuple_list_type!(C),
+            Rhs
+        );
+        type IndividuallyMergedPost =
+            merge_tuple_list_type!(Lhs, tuple_list_type!(D), tuple_list_type!(E));
+        type MergedCloned = merge_tuple_list_type!(Merged);
+
+        let lhs: Lhs = tuple_list!(A, B, C);
+        let rhs: Rhs = tuple_list!(D, E);
+        let merged: Merged = lhs.merge(rhs);
+        let merged: IndividuallyMergedPre = merged;
+        let merged: IndividuallyMergedPost = merged;
+        #[allow(clippy::no_effect_underscore_binding)]
+        let _merged: MergedCloned = merged;
+    }
+
+    /// Function that tests the tuple macros
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_macros() {
+        let mut t = tuple_list!(1, "a");
+
+        tuple_for_each!(f1, std::fmt::Display, t, |x| {
+            log::info!("{x}");
+        });
+
+        tuple_for_each_mut!(f2, std::fmt::Display, t, |x| {
+            log::info!("{x}");
+        });
     }
 }

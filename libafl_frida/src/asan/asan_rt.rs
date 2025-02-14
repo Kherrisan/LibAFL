@@ -6,15 +6,13 @@ even if the target would not have crashed under normal conditions.
 this helps finding mem errors early.
 */
 
-use core::{
-    fmt::{self, Debug, Formatter},
-    ptr::addr_of_mut,
-};
+use core::fmt::{self, Debug, Formatter};
 use std::{
-    ffi::c_void,
-    num::NonZeroUsize,
-    ptr::{addr_of, write_volatile},
+    cell::Cell,
+    ffi::{c_char, c_void},
+    ptr::write_volatile,
     rc::Rc,
+    sync::{Mutex, MutexGuard},
 };
 
 use backtrace::Backtrace;
@@ -25,26 +23,22 @@ use frida_gum::instruction_writer::X86Register;
 use frida_gum::instruction_writer::{Aarch64Register, IndexMode};
 use frida_gum::{
     instruction_writer::InstructionWriter, interceptor::Interceptor, stalker::StalkerOutput, Gum,
-    Module, ModuleDetails, ModuleMap, NativePointer, PageProtection, RangeDetails,
+    Module, ModuleMap, NativePointer, PageProtection, Process, RangeDetails,
 };
 use frida_gum_sys::Insn;
 use hashbrown::HashMap;
-use libafl_bolts::{cli::FuzzerOptions, AsSlice};
-// #[cfg(target_vendor = "apple")]
-// use libc::RLIMIT_STACK;
-use libc::{c_char, wchar_t};
-// #[cfg(target_vendor = "apple")]
-// use libc::{getrlimit, rlimit};
-// #[cfg(all(unix, not(target_vendor = "apple")))]
-// use libc::{getrlimit64, rlimit64};
-use nix::sys::mman::{mmap, MapFlags, ProtFlags};
+use libafl_bolts::{cli::FuzzerOptions, get_thread_id, has_tls};
+use libc::wchar_t;
 use rangemap::RangeMap;
 #[cfg(target_arch = "aarch64")]
 use yaxpeax_arch::Arch;
 #[cfg(target_arch = "aarch64")]
 use yaxpeax_arm::armv8::a64::{ARMv8, InstDecoder, Opcode, Operand, ShiftStyle, SizeCode};
 #[cfg(target_arch = "x86_64")]
-use yaxpeax_x86::amd64::{InstDecoder, Instruction, Opcode};
+use yaxpeax_x86::{
+    amd64::{InstDecoder, Instruction, Opcode},
+    long_mode::DisplayStyle,
+};
 
 #[cfg(target_arch = "x86_64")]
 use crate::utils::frida_to_cs;
@@ -63,22 +57,156 @@ extern "C" {
     fn __register_frame(begin: *mut c_void);
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(target_vendor = "apple"))]
 extern "C" {
     fn tls_ptr() -> *const c_void;
 }
 
-// #[cfg(target_vendor = "apple")]
-// const ANONYMOUS_FLAG: MapFlags = MapFlags::MAP_ANON;
-// #[cfg(not(target_vendor = "apple"))]
-// const ANONYMOUS_FLAG: MapFlags = MapFlags::MAP_ANONYMOUS;
+// Reentrancy guard for the hooks
+// We don't want to hook any operation initiated by the code of our hook
+// Otherwise, we get into infinite recursion or deadlock
+thread_local! {
+    static ASAN_IN_HOOK: Cell<bool> = const { Cell::new(false) };
+}
 
-/// The count of registers that need to be saved by the asan runtime
-/// sixteen general purpose registers are put in this order, rax, rbx, rcx, rdx, rbp, rsp, rsi, rdi, r8-r15, plus instrumented rip, accessed memory addr and true rip
+/// RAII guard to set and reset the `ASAN_IN_HOOK` properly
+#[derive(Debug)]
+pub struct AsanInHookGuard;
+
+impl AsanInHookGuard {
+    /// Constructor to save the current last error
+    #[must_use]
+    pub fn new() -> Self {
+        ASAN_IN_HOOK.set(true);
+        AsanInHookGuard
+    }
+}
+impl Drop for AsanInHookGuard {
+    fn drop(&mut self) {
+        ASAN_IN_HOOK.set(false);
+    }
+}
+impl Default for AsanInHookGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+/// The Lock below is a simple spinlock that uses the thread id as the lock value.
+/// This is a simple way to prevent reentrancy in the hooks when we don't have TLS.
+/// This is not a perfect solution, as it is global so it orders all threads without TLS.
+/// However, this is a rare situation and should not affect performance significantly.
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+#[derive(Debug)]
+struct Lock {
+    state: AtomicU64,
+}
+impl Lock {
+    const fn new() -> Self {
+        Lock {
+            state: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    fn lock(&self) -> LockResult {
+        let current_thread_id = get_thread_id();
+        loop {
+            let current_lock = self.state.load(Ordering::Relaxed);
+            if current_lock == u64::MAX {
+                if self
+                    .state
+                    .compare_exchange(
+                        u64::MAX,
+                        current_thread_id,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return LockResult::Acquired; // Lock acquired
+                }
+            } else if current_lock == current_thread_id {
+                return LockResult::AlreadyLocked; // Already locked by the same thread
+            }
+            thread::yield_now(); // Busy wait
+        }
+    }
+
+    fn unlock(&self) -> UnlockResult {
+        let current_thread_id = get_thread_id();
+        let current_lock = self.state.load(Ordering::Relaxed);
+        if current_lock == current_thread_id {
+            self.state.store(u64::MAX, Ordering::Release);
+            return UnlockResult::Success; // Lock released
+        }
+        UnlockResult::NotOwner // Lock not owned by the current thread
+    }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use errno::{errno, set_errno, Errno};
+#[cfg(target_os = "windows")]
+use winapi::shared::minwindef::DWORD;
+/// We need to save and restore the last error in the hooks
+#[cfg(target_os = "windows")]
+use winapi::um::errhandlingapi::{GetLastError, SetLastError};
+
+struct LastErrorGuard {
+    #[cfg(target_os = "windows")]
+    last_error: DWORD,
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    last_error: Errno,
+}
+
+impl LastErrorGuard {
+    // Constructor to save the current last error
+    fn new() -> Self {
+        #[cfg(target_os = "windows")]
+        let last_error = unsafe { GetLastError() };
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        let last_error = errno();
+
+        LastErrorGuard { last_error }
+    }
+}
+
+// Implement the Drop trait to restore the last error
+impl Drop for LastErrorGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            SetLastError(self.last_error);
+        }
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        set_errno(self.last_error);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum LockResult {
+    Acquired,
+    AlreadyLocked,
+}
+
+#[derive(Debug, PartialEq)]
+enum UnlockResult {
+    Success,
+    NotOwner,
+}
+
+// For threads without TLS, we use a static lock to prevent hook reentrancy
+// This is not as efficient as using TLS, because it prevent TLS-free threads
+// from running in parallel, but such situations are very rare (Windows loaded thread pool)
+// and should not affect performance significantly
+static TLS_LESS_LOCK: Lock = Lock::new();
+
+/// The count of registers that need to be saved by the `ASan` runtime.
+///
+/// Sixteen general purpose registers are put in this order, `rax`, `rbx`, `rcx`, `rdx`, `rbp`, `rsp`, `rsi`, `rdi`, `r8-r15`, plus instrumented `rip`, accessed memory addr and true `rip`
 #[cfg(target_arch = "x86_64")]
 pub const ASAN_SAVE_REGISTER_COUNT: usize = 19;
 
-/// The registers that need to be saved by the asan runtime, as names
+/// The registers that need to be saved by the `ASan` runtime, as names
 #[cfg(target_arch = "x86_64")]
 pub const ASAN_SAVE_REGISTER_NAMES: [&str; ASAN_SAVE_REGISTER_COUNT] = [
     "rax",
@@ -113,15 +241,16 @@ const ASAN_EH_FRAME_FDE_OFFSET: u32 = 20;
 #[cfg(target_arch = "aarch64")]
 const ASAN_EH_FRAME_FDE_ADDRESS_OFFSET: u32 = 28;
 
-/// The frida address sanitizer runtime, providing address sanitization.
-/// When executing in `ASAN`, each memory access will get checked, using frida stalker under the hood.
+/// The `FRIDA` address sanitizer runtime, providing address sanitization.
+///
+/// When executing in `ASan`, each memory access will get checked, using `FRIDA` stalker under the hood.
 /// The runtime can report memory errors that occurred during execution,
 /// even if the target would not have crashed under normal conditions.
 /// this helps finding mem errors early.
 pub struct AsanRuntime {
     check_for_leaks_enabled: bool,
     current_report_impl: u64,
-    allocator: Allocator,
+    allocator: Mutex<Allocator>,
     regs: [usize; ASAN_SAVE_REGISTER_COUNT],
     blob_report: Option<Box<[u8]>>,
     blob_check_mem_byte: Option<Box<[u8]>>,
@@ -141,8 +270,10 @@ pub struct AsanRuntime {
     suppressed_addresses: Vec<usize>,
     skip_ranges: Vec<SkipRange>,
     continue_on_error: bool,
-    shadow_check_func: Option<extern "C" fn(*const c_void, usize) -> bool>,
-
+    pc: Option<usize>,
+    hooks: Vec<NativePointer>,
+    pub(crate) hooks_enabled: bool,
+    // thread_in_hook: ThreadLocal<Cell<bool>>,
     #[cfg(target_arch = "aarch64")]
     eh_frame: [u32; ASAN_EH_FRAME_DWORD_COUNT],
 }
@@ -166,124 +297,51 @@ impl FridaRuntime for AsanRuntime {
     fn init(
         &mut self,
         gum: &Gum,
-        _ranges: &RangeMap<usize, (u16, String)>,
+        _ranges: &RangeMap<u64, (u16, String)>,
         module_map: &Rc<ModuleMap>,
     ) {
-        self.allocator.init();
+        self.allocator_mut().init();
 
-        unsafe {
-            ASAN_ERRORS = Some(AsanErrors::new(self.continue_on_error));
-        }
-
-        self.generate_instrumentation_blobs();
-
-        self.generate_shadow_check_function();
-        self.unpoison_all_existing_memory();
+        AsanErrors::get_mut_blocking().set_continue_on_error(self.continue_on_error);
 
         self.module_map = Some(module_map.clone());
         self.suppressed_addresses
             .extend(self.skip_ranges.iter().map(|skip| match skip {
                 SkipRange::Absolute(range) => range.start,
                 SkipRange::ModuleRelative { name, range } => {
-                    let module_details = ModuleDetails::with_name(name.clone()).unwrap();
-                    let lib_start = module_details.range().base_address().0 as usize;
+                    let module = Module::load(gum, name);
+                    let lib_start = module.range().base_address().0 as usize;
                     lib_start + range.start
                 }
             }));
 
-        self.hook_functions(gum);
-
-        /* unsafe {
-            let mem = self.allocator.alloc(0xac + 2, 8);
-            log::info!("Test0");
-            /*
-            0x555555916ce9 <libafl_frida::asan_rt::AsanRuntime::init+13033>    je     libafl_frida::asan_rt::AsanRuntime::init+14852 <libafl_frida::asan_rt::AsanRuntime::init+14852>
-            0x555555916cef <libafl_frida::asan_rt::AsanRuntime::init+13039>    mov    rdi, r15 <0x555558392338>
-            */
-            assert!((self.shadow_check_func.unwrap())(
-                (mem as usize) as *const c_void,
-                0x00
-            ));
-            log::info!("Test1");
-            assert!((self.shadow_check_func.unwrap())(
-                (mem as usize) as *const c_void,
-                0xac
-            ));
-            log::info!("Test2");
-            assert!((self.shadow_check_func.unwrap())(
-                ((mem as usize) + 2) as *const c_void,
-                0xac
-            ));
-            log::info!("Test3");
-            assert!(!(self.shadow_check_func.unwrap())(
-                ((mem as usize) + 3) as *const c_void,
-                0xac
-            ));
-            log::info!("Test4");
-            assert!(!(self.shadow_check_func.unwrap())(
-                ((mem as isize) + -1) as *const c_void,
-                0xac
-            ));
-            log::info!("Test5");
-            assert!((self.shadow_check_func.unwrap())(
-                ((mem as usize) + 2 + 0xa4) as *const c_void,
-                8
-            ));
-            log::info!("Test6");
-            assert!((self.shadow_check_func.unwrap())(
-                ((mem as usize) + 2 + 0xa6) as *const c_void,
-                6
-            ));
-            log::info!("Test7");
-            assert!(!(self.shadow_check_func.unwrap())(
-                ((mem as usize) + 2 + 0xa8) as *const c_void,
-                6
-            ));
-            log::info!("Test8");
-            assert!(!(self.shadow_check_func.unwrap())(
-                ((mem as usize) + 2 + 0xa8) as *const c_void,
-                0xac
-            ));
-            log::info!("Test9");
-            assert!((self.shadow_check_func.unwrap())(
-                ((mem as usize) + 4 + 0xa8) as *const c_void,
-                0x1
-            ));
-            log::info!("FIN");
-
-            for i in 0..0xad {
-                assert!((self.shadow_check_func.unwrap())(
-                    ((mem as usize) + i) as *const c_void,
-                    0x01
-                ));
-            }
-            // assert!((self.shadow_check_func.unwrap())(((mem2 as usize) + 8875) as *const c_void, 4));
-        }*/
-
+        self.register_hooks(gum);
+        self.generate_instrumentation_blobs();
+        self.unpoison_all_existing_memory();
         self.register_thread();
     }
-    fn pre_exec<I: libafl::inputs::Input + libafl::inputs::HasTargetBytes>(
-        &mut self,
-        input: &I,
-    ) -> Result<(), libafl::Error> {
-        let target_bytes = input.target_bytes();
-        let slice = target_bytes.as_slice();
 
-        self.unpoison(slice.as_ptr() as usize, slice.len());
+    fn deinit(&mut self, gum: &Gum) {
+        self.deregister_hooks(gum);
+    }
+
+    fn pre_exec(&mut self, input_bytes: &[u8]) -> Result<(), libafl::Error> {
+        self.unpoison(input_bytes.as_ptr() as usize, input_bytes.len());
+        self.enable_hooks();
         Ok(())
     }
 
-    fn post_exec<I: libafl::inputs::Input + libafl::inputs::HasTargetBytes>(
-        &mut self,
-        input: &I,
-    ) -> Result<(), libafl::Error> {
+    fn post_exec(&mut self, input_bytes: &[u8]) -> Result<(), libafl::Error> {
+        self.disable_hooks();
         if self.check_for_leaks_enabled {
             self.check_for_leaks();
         }
 
-        let target_bytes = input.target_bytes();
-        let slice = target_bytes.as_slice();
-        self.poison(slice.as_ptr() as usize, slice.len());
+        // # Safety
+        // The ptr and length are correct.
+        unsafe {
+            self.poison(input_bytes.as_ptr() as usize, input_bytes.len());
+        }
         self.reset_allocations();
 
         Ok(())
@@ -305,7 +363,7 @@ impl AsanRuntime {
         let continue_on_error = options.continue_on_error;
         Self {
             check_for_leaks_enabled: options.detect_leaks,
-            allocator: Allocator::new(options),
+            allocator: Mutex::new(Allocator::new(options)),
             skip_ranges,
             continue_on_error,
             ..Self::default()
@@ -313,49 +371,47 @@ impl AsanRuntime {
     }
 
     /// Reset all allocations so that they can be reused for new allocation requests.
-    #[allow(clippy::unused_self)]
     pub fn reset_allocations(&mut self) {
-        self.allocator.reset();
+        self.allocator_mut().reset();
     }
 
     /// Gets the allocator
-    #[must_use]
-    pub fn allocator(&self) -> &Allocator {
-        &self.allocator
+    pub fn allocator(&self) -> MutexGuard<Allocator> {
+        self.allocator.lock().unwrap()
     }
 
     /// Gets the allocator (mutable)
-    pub fn allocator_mut(&mut self) -> &mut Allocator {
-        &mut self.allocator
-    }
-
-    /// The function that checks the shadow byte
-    #[must_use]
-    pub fn shadow_check_func(&self) -> &Option<extern "C" fn(*const c_void, usize) -> bool> {
-        &self.shadow_check_func
+    pub fn allocator_mut(&mut self) -> MutexGuard<Allocator> {
+        self.allocator.lock().unwrap()
     }
 
     /// Check if the test leaked any memory and report it if so.
     pub fn check_for_leaks(&mut self) {
-        self.allocator.check_for_leaks();
+        self.allocator_mut().check_for_leaks();
     }
 
-    /// Returns the `AsanErrors` from the recent run
-    #[allow(clippy::unused_self)]
-    pub fn errors(&mut self) -> &Option<AsanErrors> {
-        unsafe { &*addr_of!(ASAN_ERRORS) }
+    /// Returns the `AsanErrors` from the recent run.
+    /// Will block if some other thread holds on to the `ASAN_ERRORS` Mutex.
+    pub fn errors(&mut self) -> MutexGuard<'static, AsanErrors> {
+        ASAN_ERRORS.lock().unwrap()
     }
 
     /// Make sure the specified memory is unpoisoned
-    #[allow(clippy::unused_self)]
     pub fn unpoison(&mut self, address: usize, size: usize) {
-        self.allocator
+        self.allocator_mut()
             .map_shadow_for_region(address, address + size, true);
     }
 
     /// Make sure the specified memory is poisoned
-    pub fn poison(&mut self, address: usize, size: usize) {
-        Allocator::poison(self.allocator.map_to_shadow(address), size);
+    ///
+    /// # Safety
+    /// The address needs to be a valid address, the size needs to be correct.
+    /// This will dereference at the address.
+    pub unsafe fn poison(&mut self, address: usize, size: usize) {
+        let start = self.allocator_mut().map_to_shadow(address);
+        if self.allocator_mut().valid_shadow(start, size) {
+            Allocator::poison(start, size);
+        }
     }
 
     /// Add a stalked address to real address mapping.
@@ -374,40 +430,50 @@ impl AsanRuntime {
     }
 
     /// Unpoison all the memory that is currently mapped with read/write permissions.
-    #[allow(clippy::unused_self)]
-    fn unpoison_all_existing_memory(&mut self) {
-        self.allocator.unpoison_all_existing_memory();
+    pub fn unpoison_all_existing_memory(&mut self) {
+        self.allocator_mut().unpoison_all_existing_memory();
+    }
+
+    /// Enable all function hooks
+    pub fn enable_hooks(&mut self) {
+        log::info!("Enabling hooks");
+        self.hooks_enabled = true;
+    }
+    /// Disable all function hooks
+    pub fn disable_hooks(&mut self) {
+        self.hooks_enabled = false;
+        log::info!("Disabling hooks");
     }
 
     /// Register the current thread with the runtime, implementing shadow memory for its stack and
     /// tls mappings.
-    #[allow(clippy::unused_self)]
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(target_vendor = "apple"))]
     pub fn register_thread(&mut self) {
         let (stack_start, stack_end) = Self::current_stack();
-        self.allocator
+        let (tls_start, tls_end) = Self::current_tls();
+        println!(
+            "registering thread {:?} with stack {stack_start:x}:{stack_end:x} and tls {tls_start:x}:{tls_end:x}", 
+            get_thread_id()
+        );
+        self.allocator_mut()
             .map_shadow_for_region(stack_start, stack_end, true);
 
-        let (tls_start, tls_end) = Self::current_tls();
-        self.allocator
+        #[cfg(unix)]
+        self.allocator_mut()
             .map_shadow_for_region(tls_start, tls_end, true);
-        log::info!(
-            "registering thread with stack {stack_start:x}:{stack_end:x} and tls {tls_start:x}:{tls_end:x}"
-        );
     }
 
     /// Register the current thread with the runtime, implementing shadow memory for its stack mapping.
-    #[allow(clippy::unused_self)]
-    #[cfg(target_os = "ios")]
+    #[cfg(target_vendor = "apple")]
     pub fn register_thread(&mut self) {
         let (stack_start, stack_end) = Self::current_stack();
-        self.allocator
+        self.allocator_mut()
             .map_shadow_for_region(stack_start, stack_end, true);
 
         log::info!("registering thread with stack {stack_start:x}:{stack_end:x}");
     }
 
-    /// Get the maximum stack size for the current stack
+    // /// Get the maximum stack size for the current stack
     // #[must_use]
     // #[cfg(target_vendor = "apple")]
     // fn max_stack_size() -> usize {
@@ -415,12 +481,12 @@ impl AsanRuntime {
     //         rlim_cur: 0,
     //         rlim_max: 0,
     //     };
-    //     assert!(unsafe { getrlimit(RLIMIT_STACK, addr_of_mut!(stack_rlimit)) } == 0);
-
+    //     assert!(unsafe { getrlimit(RLIMIT_STACK, &raw mut stack_rlimit) } == 0);
+    //
     //     stack_rlimit.rlim_cur as usize
     // }
-
-    /// Get the maximum stack size for the current stack
+    //
+    // /// Get the maximum stack size for the current stack
     // #[must_use]
     // #[cfg(all(unix, not(target_vendor = "apple")))]
     // fn max_stack_size() -> usize {
@@ -428,8 +494,8 @@ impl AsanRuntime {
     //         rlim_cur: 0,
     //         rlim_max: 0,
     //     };
-    //     assert!(unsafe { getrlimit64(RLIMIT_STACK, addr_of_mut!(stack_rlimit)) } == 0);
-
+    //     assert!(unsafe { getrlimit64(RLIMIT_STACK, &raw mut stack_rlimit) } == 0);
+    //
     //     stack_rlimit.rlim_cur as usize
     // }
 
@@ -440,13 +506,17 @@ impl AsanRuntime {
     fn range_for_address(address: usize) -> (usize, usize) {
         let mut start = 0;
         let mut end = 0;
-        RangeDetails::enumerate_with_prot(PageProtection::NoAccess, &mut |range: &RangeDetails| {
+
+        RangeDetails::enumerate_with_prot(PageProtection::Read, &mut |range: &RangeDetails| {
             let range_start = range.memory_range().base_address().0 as usize;
             let range_end = range_start + range.memory_range().size();
             if range_start <= address && range_end >= address {
                 start = range_start;
                 end = range_end;
-                // I want to stop iteration here
+                return false;
+            }
+            if address < start {
+                //if the address is less than the start then we cannot find it
                 return false;
             }
             true
@@ -468,43 +538,24 @@ impl AsanRuntime {
     #[must_use]
     pub fn current_stack() -> (usize, usize) {
         let mut stack_var = 0xeadbeef;
-        let stack_address = addr_of_mut!(stack_var) as usize;
+        let stack_address = &raw mut stack_var as usize;
         // let range_details = RangeDetails::with_address(stack_address as u64).unwrap();
         // Write something to (hopefully) make sure the val isn't optimized out
+
         unsafe {
             write_volatile(&mut stack_var, 0xfadbeef);
         }
 
-        // let start = range_details.memory_range().base_address().0 as usize;
-        // let end = start + range_details.memory_range().size();
-        // (start, end)
-        Self::range_for_address(stack_address)
+        let range = Self::range_for_address(stack_address);
 
-        // let max_start = end - Self::max_stack_size();
+        assert_ne!(range.0, 0, "Couldn't find stack mapping!");
 
-        // let flags = ANONYMOUS_FLAG | MapFlags::MAP_FIXED | MapFlags::MAP_PRIVATE;
-        // #[cfg(not(target_vendor = "apple"))]
-        // let flags = flags | MapFlags::MAP_STACK;
-
-        // if start != max_start {
-        //     let mapping = unsafe {
-        //         mmap(
-        //             NonZeroUsize::new(max_start),
-        //             NonZeroUsize::new(start - max_start).unwrap(),
-        //             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-        //             flags,
-        //             -1,
-        //             0,
-        //         )
-        //     };
-        //     assert!(mapping.unwrap() as usize == max_start);
-        // }
-        // (max_start, end)
+        (range.1 - 1024 * 1024, range.1)
     }
 
     /// Determine the tls start, end for the currently running thread
     #[must_use]
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(target_vendor = "apple"))]
     fn current_tls() -> (usize, usize) {
         let tls_address = unsafe { tls_ptr() } as usize;
 
@@ -522,106 +573,563 @@ impl AsanRuntime {
     }
 
     /// Gets the current instruction pointer
-    #[cfg(target_arch = "aarch64")]
     #[must_use]
     #[inline]
-    pub fn pc() -> usize {
-        Interceptor::current_invocation().cpu_context().pc() as usize
+    pub fn pc(&self) -> usize {
+        if let Some(pc) = self.pc.as_ref() {
+            *pc
+        } else {
+            0
+        }
     }
 
-    /// Gets the current instruction pointer
-    #[cfg(target_arch = "x86_64")]
-    #[must_use]
-    #[inline]
-    pub fn pc() -> usize {
-        Interceptor::current_invocation().cpu_context().rip() as usize
+    /// Set the current program counter at hook time
+    pub fn set_pc(&mut self, pc: usize) {
+        self.pc = Some(pc);
+    }
+    /// Unset the current program counter
+    pub fn unset_pc(&mut self) {
+        self.pc = None;
     }
 
-    /// Hook all functions required for ASAN to function, replacing them with our own
-    /// implementations.
-    #[allow(clippy::items_after_statements)]
-    #[allow(clippy::too_many_lines)]
-    fn hook_functions(&mut self, gum: &Gum) {
-        let mut interceptor = frida_gum::interceptor::Interceptor::obtain(gum);
-
+    /// Register the required hooks
+    #[expect(clippy::too_many_lines)]
+    pub fn register_hooks(&mut self, gum: &Gum) {
+        let mut interceptor = Interceptor::obtain(gum);
+        let process = Process::obtain(gum);
         macro_rules! hook_func {
-            ($lib:expr, $name:ident, ($($param:ident : $param_type:ty),*), $return_type:ty) => {
+            ($name:ident, ($($param:ident : $param_type:ty),*), $return_type:ty) => {
                 paste::paste! {
-                    log::trace!("Hooking {}", stringify!($name));
-                    extern "C" {
-                        fn $name($($param: $param_type),*) -> $return_type;
-                    }
+
+                    let target_function = Module::find_global_export_by_name(stringify!($name)).expect("Failed to find function");
+                    log::warn!("Hooking {} = {:?}", stringify!($name), target_function.0);
+
+                    static [<$name:snake:upper _PTR>]: std::sync::OnceLock<extern "C" fn($($param: $param_type),*) -> $return_type> = std::sync::OnceLock::new();
+
+                    let _ = [<$name:snake:upper _PTR>].set(unsafe {std::mem::transmute::<*const c_void, extern "C" fn($($param: $param_type),*) -> $return_type>(target_function.0)}).unwrap();
+
                     #[allow(non_snake_case)]
                     unsafe extern "C" fn [<replacement_ $name>]($($param: $param_type),*) -> $return_type {
+                        let _last_error_guard = LastErrorGuard::new();
                         let mut invocation = Interceptor::current_invocation();
                         let this = &mut *(invocation.replacement_data().unwrap().0 as *mut AsanRuntime);
-                        let real_address = this.real_address_for_stalked(invocation.return_addr());
-                        if !this.suppressed_addresses.contains(&real_address) && this.module_map.as_ref().unwrap().find(real_address as u64).is_some() {
-                            this.[<hook_ $name>]($($param),*)
-                        } else {
-                            $name($($param),*)
+                        //is this necessary? The stalked return address will always be the real return address
+                     //   let real_address = this.real_address_for_stalked(invocation.return_addr());
+                        let original = [<$name:snake:upper _PTR>].get().unwrap();
+                        if this.hooks_enabled {
+                            if has_tls() {
+                                if !ASAN_IN_HOOK.get(){
+                                    let _guard = AsanInHookGuard::new(); // Ensure ASAN_IN_HOOK is set and reset
+                                    return this.[<hook_ $name>](*original, $($param),*);
+                                }
+                            }
+                            // else{
+                            //     log::warn!("{} called without TLS", stringify!($name));
+                            //     $(
+                            //         log::warn!("{}: {:?}", stringify!($param), $param);
+                            //     )*
+
+                            // }
                         }
+                        (original)($($param),*)
                     }
-                    interceptor.replace(
-                        frida_gum::Module::find_export_by_name($lib, stringify!($name)).expect("Failed to find function"),
+
+                    let self_ptr = core::ptr::from_ref(self) as usize;
+                    let _ = interceptor.replace(
+                        target_function,
                         NativePointer([<replacement_ $name>] as *mut c_void),
-                        NativePointer(core::ptr::from_mut(self) as *mut c_void)
-                    ).ok();
+                        NativePointer(self_ptr as *mut c_void)
+                    );
+
+                    self.hooks.push(target_function);
                 }
-            }
+            };
+            //Library specific macro rule. lib and lib_ident are both needed because we need to generate a unique static variable and only name is insufficient. In addition, the lib name could contain invalid characters (i.e., lib.so is an invalid name)
+            ($lib:literal, $lib_ident:ident, $name:ident, ($($param:ident : $param_type:ty),*), $return_type:ty) => {
+                paste::paste! {
+
+                    log::warn!("Hooking {}:{}", $lib, stringify!($name));
+                    let target_function = process.find_module_by_name($lib).expect("Failed to find module").find_export_by_name(stringify!($name)).expect("Failed to find function");
+                    log::warn!("Hooking {}:{} = {:?}", $lib, stringify!($name), target_function.0);
+
+                    static [<$lib_ident:snake:upper _ $name:snake:upper _PTR>]: std::sync::OnceLock<extern "C" fn($($param: $param_type),*) -> $return_type> = std::sync::OnceLock::new();
+
+                    let _ = [<$lib_ident:snake:upper _ $name:snake:upper _PTR>].set(unsafe {std::mem::transmute::<*const c_void, extern "C" fn($($param: $param_type),*) -> $return_type>(target_function.0)}).unwrap();
+
+                    #[allow(non_snake_case)]
+                    unsafe extern "C" fn [<replacement_ $name>]($($param: $param_type),*) -> $return_type {
+                        let _last_error_guard = LastErrorGuard::new();
+                        let mut invocation = Interceptor::current_invocation();
+                        let this = &mut *(invocation.replacement_data().unwrap().0 as *mut AsanRuntime);
+                        //is this necessary? The stalked return address will always be the real return address
+                     //   let real_address = this.real_address_for_stalked(invocation.return_addr());
+                        let original = [<$lib_ident:snake:upper _ $name:snake:upper _PTR>].get().unwrap();
+                        if this.hooks_enabled {
+                            if has_tls() {
+                                if !ASAN_IN_HOOK.get(){
+                                    let _guard = AsanInHookGuard::new(); // Ensure ASAN_IN_HOOK is set and reset
+                                    return this.[<hook_ $name>](*original, $($param),*);
+                                }
+                            }
+                        }
+                        (original)($($param),*)
+                    }
+
+                    let self_ptr = core::ptr::from_ref(self) as usize;
+                    let _ = interceptor.replace(
+                        target_function,
+                        NativePointer([<replacement_ $name>] as *mut c_void),
+                        NativePointer(self_ptr as *mut c_void)
+                    );
+
+                    self.hooks.push(target_function);
+                }
+            };
         }
 
+        #[allow(unused_macro_rules)]
         macro_rules! hook_func_with_check {
-            ($lib:expr, $name:ident, ($($param:ident : $param_type:ty),*), $return_type:ty) => {
+            //No library case
+            ($name:ident, ($($param:ident : $param_type:ty),*), $return_type:ty, $always_enabled:expr ) => {
                 paste::paste! {
-                    extern "C" {
-                        fn $name($($param: $param_type),*) -> $return_type;
-                    }
-                    #[allow(non_snake_case)]
+                    let target_function = Module::find_global_export_by_name(stringify!($name)).expect("Failed to find function");
+
+                    log::warn!("Hooking {} = {:?}", stringify!($name), target_function.0);
+                    static [<$name:snake:upper _PTR>]: std::sync::OnceLock<extern "C" fn($($param: $param_type),*) -> $return_type> = std::sync::OnceLock::new();
+
+                    let _ = [<$name:snake:upper _PTR>].set(unsafe {std::mem::transmute::<*const c_void, extern "C" fn($($param: $param_type),*) -> $return_type>(target_function.0)}).unwrap_or_else(|e| println!("{:?}", e));
+
+                    #[allow(non_snake_case)] // depends on the values the macro is invoked with
+                    #[allow(clippy::redundant_else)]
                     unsafe extern "C" fn [<replacement_ $name>]($($param: $param_type),*) -> $return_type {
+                        let _last_error_guard = LastErrorGuard::new();
                         let mut invocation = Interceptor::current_invocation();
                         let this = &mut *(invocation.replacement_data().unwrap().0 as *mut AsanRuntime);
-                        if this.[<hook_check_ $name>]($($param),*) {
-                            this.[<hook_ $name>]($($param),*)
-                        } else {
-                            $name($($param),*)
-                        }
-                    }
-                    interceptor.replace(
-                        frida_gum::Module::find_export_by_name($lib, stringify!($name)).expect("Failed to find function"),
-                        NativePointer([<replacement_ $name>] as *mut c_void),
-                        NativePointer(core::ptr::from_mut(self) as *mut c_void)
-                    ).ok();
-                }
-            }
-        }
+                        let original = [<$name:snake:upper _PTR>].get().unwrap();
+                        if $always_enabled || this.hooks_enabled {
+                            if has_tls() {
+                                if !ASAN_IN_HOOK.get(){
+                                    let _guard = AsanInHookGuard::new(); // Ensure ASAN_IN_HOOK is set and reset
+                                    if this.[<hook_check_ $name>]($($param),*){
+                                        return this.[<hook_ $name>](*original, $($param),*);
+                                    }
+                                }
+                            }
+                            else{
+                                // log::warn!("{} called without TLS", stringify!($name));
+                                // $(
+                                //     log::warn!("Params: {}: {:?}", stringify!($param), $param);
+                                // )*
+                                if $always_enabled {
+                                    if TLS_LESS_LOCK.lock() == LockResult::Acquired && this.[<hook_check_ $name>]($($param),*){
+                                        // There is no TLS and we have grabbed the lock - call the hook
+                                        let ret = this.[<hook_ $name>](*original, $($param),*);
+                                        TLS_LESS_LOCK.unlock();
 
+                                        return ret;
+                                    }
+                                    else {
+                                        TLS_LESS_LOCK.unlock(); // Return the original function
+                                    }
+
+                                }
+                            }
+                        }
+                        (original)($($param),*)
+                    }
+
+                    let self_ptr = core::ptr::from_ref(self) as usize;
+                    let _ = interceptor.replace(
+                        target_function,
+                        NativePointer([<replacement_ $name>] as *mut c_void),
+                        NativePointer(self_ptr as *mut c_void)
+                    );
+                    self.hooks.push(target_function);
+                }
+            };
+            //Library specific macro rule. lib and lib_ident are both needed because we need to generate a unique static variable and only name is insufficient. In addition, the lib name could contain invalid characters (i.e., lib.so is an invalid name)
+            ($lib:literal, $lib_ident:ident, $name:ident, ($($param:ident : $param_type:ty),*), $return_type:ty, $always_enabled:expr ) => {
+                paste::paste! {
+                    let target_function = process.find_module_by_name($lib).expect("Failed to find module").find_export_by_name(stringify!($name)).expect("Failed to find function");
+
+                    log::warn!("Hooking {}:{} = {:?}", $lib, stringify!($name), target_function.0);
+                    static [<$lib_ident:snake:upper _ $name:snake:upper _PTR>]: std::sync::OnceLock<extern "C" fn($($param: $param_type),*) -> $return_type> = std::sync::OnceLock::new();
+
+                    let _ = [<$lib_ident:snake:upper _ $name:snake:upper _PTR>].set(unsafe {std::mem::transmute::<*const c_void, extern "C" fn($($param: $param_type),*) -> $return_type>(target_function.0)}).unwrap_or_else(|e| println!("{:?}", e));
+
+                    #[allow(non_snake_case)]
+                    #[allow(clippy::redundant_else)]
+                    unsafe extern "C" fn [<replacement_ $name>]($($param: $param_type),*) -> $return_type {
+                        let _last_error_guard = LastErrorGuard::new();
+                        let mut invocation = Interceptor::current_invocation();
+                        let this = &mut *(invocation.replacement_data().unwrap().0 as *mut AsanRuntime);
+                        let original = [<$lib_ident:snake:upper _ $name:snake:upper _PTR>].get().unwrap();
+                        if $always_enabled || this.hooks_enabled {
+                            if has_tls() {
+                                if !ASAN_IN_HOOK.get(){
+                                    let _guard = AsanInHookGuard::new(); // Ensure ASAN_IN_HOOK is set and reset
+                                    if this.[<hook_check_ $name>]($($param),*){
+                                        return this.[<hook_ $name>](*original, $($param),*);
+                                    }
+                                }
+                            }
+                            else{
+                                if $always_enabled {
+                                    if TLS_LESS_LOCK.lock() == LockResult::Acquired && this.[<hook_check_ $name>]($($param),*){
+                                        // There is no TLS and we have grabbed the lock - call the hook
+                                        let ret = this.[<hook_ $name>](*original, $($param),*);
+                                        TLS_LESS_LOCK.unlock();
+
+                                        return ret;
+                                    }
+                                    else {
+                                        TLS_LESS_LOCK.unlock(); // Return the original function
+                                    }
+                                }
+                            }
+                        }
+                        (original)($($param),*)
+                    }
+
+                    let self_ptr = core::ptr::from_ref(self) as usize;
+                    let _ = interceptor.replace(
+                        target_function,
+                        NativePointer([<replacement_ $name>] as *mut c_void),
+                        NativePointer(self_ptr as *mut c_void)
+                    );
+                    self.hooks.push(target_function);
+                }
+            };
+            // Default case without check_enabled parameter
+            ($name:ident, ($($param:ident : $param_type:ty),*), $return_type:ty) => {
+                hook_func_with_check!($name, ($($param: $param_type),*), $return_type, false);
+            };
+            ($lib:literal, $lib_ident:ident, $name:ident, ($($param:ident : $param_type:ty),*), $return_type:ty) => {
+                hook_func_with_check!($lib, $lib_ident, $name, ($($param: $param_type),*), $return_type, false);
+            };
+        }
         // Hook the memory allocator functions
-        hook_func!(None, malloc, (size: usize), *mut c_void);
-        hook_func!(None, calloc, (nmemb: usize, size: usize), *mut c_void);
-        hook_func!(None, realloc, (ptr: *mut c_void, size: usize), *mut c_void);
-        hook_func_with_check!(None, free, (ptr: *mut c_void), ());
-        #[cfg(not(target_vendor = "apple"))]
-        hook_func!(None, memalign, (size: usize, alignment: usize), *mut c_void);
+
+        #[cfg(not(windows))]
+        hook_func!(malloc, (size: usize), *mut c_void);
+        #[cfg(not(windows))]
+        hook_func!(calloc, (nmemb: usize, size: usize), *mut c_void);
+        #[cfg(not(windows))]
+        hook_func_with_check!(realloc, (ptr: *mut c_void, size: usize), *mut c_void, false);
+        #[cfg(not(windows))]
+        hook_func_with_check!(free, (ptr: *mut c_void), usize, true);
+        #[cfg(not(any(target_vendor = "apple", windows)))]
+        hook_func!(memalign, (size: usize, alignment: usize), *mut c_void);
+        #[cfg(not(windows))]
         hook_func!(
-            None,
             posix_memalign,
             (pptr: *mut *mut c_void, size: usize, alignment: usize),
             i32
         );
-        #[cfg(not(target_vendor = "apple"))]
-        hook_func!(None, malloc_usable_size, (ptr: *mut c_void), usize);
+        #[cfg(not(any(target_vendor = "apple", windows)))]
+        hook_func!(malloc_usable_size, (ptr: *mut c_void), usize);
+        #[cfg(target_vendor = "apple")]
+        hook_func!(valloc, (size: usize), *mut c_void);
+        #[cfg(target_vendor = "apple")]
+        hook_func_with_check!(reallocf, (ptr: *mut c_void, size: usize), *mut c_void, false);
+        #[cfg(target_vendor = "apple")]
+        hook_func_with_check!(malloc_size, (ptr: *mut c_void), usize, false);
+        #[cfg(target_vendor = "apple")]
+        hook_func_with_check!(malloc_good_size, (ptr: *mut c_void), usize, false);
+        #[cfg(target_vendor = "apple")]
+        hook_func!("libSystem.B.dylib", libSystemB, os_log_type_enabled, (oslog: *mut c_void, r#type: u8), bool);
+        #[cfg(target_vendor = "apple")]
+        hook_func!("libSystem.B.dylib", libSystemB, _os_log_impl, (dso: *const c_void, log: *mut c_void, r#type: u8, format: *const c_char, buf: *const u8, size: u32), ());
+        #[cfg(target_vendor = "apple")]
+        hook_func!("libSystem.B.dylib", libSystemB, _os_log_fault_impl, (dso: *const c_void, log: *mut c_void, r#type: u8, format: *const c_char, buf: *const u8, size: u32), ());
+        #[cfg(target_vendor = "apple")]
+        hook_func!("libSystem.B.dylib", libSystemB, _os_log_error_impl, (dso: *const c_void, log: *mut c_void, r#type: u8, format: *const c_char, buf: *const u8, size: u32), ());
+        #[cfg(target_vendor = "apple")]
+        hook_func!("libSystem.B.dylib", libSystemB, _os_log_debug_impl, (dso: *const c_void, log: *mut c_void, r#type: u8, format: *const c_char, buf: *const u8, size: u32), ());
+        #[cfg(target_vendor = "apple")]
+        hook_func!("libc++.1.dylib", libcpp, __cxa_allocate_exception, (size: usize), *const c_void);
+        #[cfg(target_vendor = "apple")]
+        hook_func!("libc++.1.dylib", libcpp, __cxa_free_exception, (ptr: *mut c_void), usize);
+        // // #[cfg(windows)]
+        // hook_priv_func!(
+        //     "c:\\windows\\system32\\ntdll.dll",
+        //     LdrpCallInitRoutine,
+        //     (base_address: *const c_void, reason: usize, context: usize, entry_point: usize),
+        //     usize
+        // );
+        // #[cfg(windows)]
+        // hook_func!(
+        //     None,
+        //     LoadLibraryExW,
+        //     (path: *const c_void, file: usize, flags: i32),
+        //     usize
+        // );
+        // #[cfg(windows)]
+        // hook_func!(
+        //     None,
+        //     CreateThread,
+        //     (thread_attributes: *const c_void, stack_size: usize, start_address: *const c_void, parameter: *const c_void, creation_flags: i32, thread_id: *mut i32),
+        //     usize
+        // );
+        // #[cfg(windows)]
+        // hook_func!(
+        //     None,
+        //     CreateFileMappingW,
+        //     (file: usize, file_mapping_attributes: *const c_void, protect: i32, maximum_size_high: u32, maximum_size_low: u32, name: *const c_void),
+        //     usize
+        // );
+        #[cfg(windows)]
+        macro_rules! hook_heap_windows {
+            ($libname:literal, $lib_ident:ident) => {
+            log::info!("Hooking allocator functions in {}", $libname);
+            if let Some(module) = process.find_module_by_name($libname) {
+            for export in module.enumerate_exports() {
+                // log::trace!("- {}", export.name);
+                match &export.name[..] {
+                    "NtGdiCreateCompatibleDC" => {
+                        hook_func!($libname, $lib_ident, NtGdiCreateCompatibleDC, (hdc: *const c_void), *mut c_void);
+                    }
+                    "RtlCreateHeap" => {
+                        hook_func!($libname, $lib_ident, RtlCreateHeap, (flags: u32, heap_base: *const c_void, reserve_size: usize, commit_size: usize, lock: *const c_void, parameters: *const c_void), *mut c_void);
+                    }
+                    "RtlDestroyHeap" => {
+                        hook_func!($libname, $lib_ident, RtlDestroyHeap, (handle: *const c_void), *mut c_void);
+                    }
+                    "HeapAlloc" => {
+                        hook_func!($libname, $lib_ident, HeapAlloc, (handle: *mut c_void, flags: u32, bytes: usize), *mut c_void);
+                    }
+                    "RtlAllocateHeap" => {
+                        hook_func!($libname, $lib_ident, RtlAllocateHeap, (handle: *mut c_void, flags: u32, bytes: usize), *mut c_void);
+                    }
+                    "HeapFree" => {
+                        hook_func_with_check!($libname, $lib_ident, HeapFree, (handle: *mut c_void, flags: u32, mem: *mut c_void), bool, true);
+                    }
+                    // NOTE: we call it with always_enabled, because on Windows, some COM memory deallocation occurs later in the process
+                    // after we have completed the run
+                    "RtlFreeHeap" => {
+                        hook_func_with_check!($libname, $lib_ident, RtlFreeHeap, (handle: *mut c_void, flags: u32, mem: *mut c_void), usize, true);
+                    }
+                    "HeapSize" => {
+                        hook_func_with_check!($libname, $lib_ident, HeapSize, (handle: *mut c_void, flags: u32, mem: *mut c_void), usize, false);
+                    }
+                    "RtlSizeHeap" => {
+                        hook_func_with_check!($libname, $lib_ident, RtlSizeHeap , (handle: *mut c_void, flags: u32, mem: *mut c_void), usize, false);
+                    }
+                    "RtlReAllocateHeap" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            RtlReAllocateHeap,
+                            (
+                                handle: *mut c_void,
+                                flags: u32,
+                                ptr: *mut c_void,
+                                size: usize
+                            ),
+                            *mut c_void
+                        );
+                    }
+                    "HeapReAlloc" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            HeapReAlloc,
+                            (
+                                handle: *mut c_void,
+                                flags: u32,
+                                ptr: *mut c_void,
+                                size: usize
+                            ),
+                            *mut c_void
+                        );
+                    }
+                    "LocalAlloc" => {
+                        hook_func!($libname, $lib_ident, LocalAlloc, (flags: u32, size: usize), *mut c_void);
+                    }
+                    "LocalReAlloc" => {
+                        hook_func!($libname, $lib_ident, LocalReAlloc, (mem: *mut c_void, size: usize, flags: u32), *mut c_void);
+                    }
+                    "LocalHandle" => {
+                        hook_func_with_check!($libname, $lib_ident, LocalHandle, (mem: *mut c_void), *mut c_void, false);
+                    }
+                    "LocalLock" => {
+                        hook_func_with_check!($libname, $lib_ident, LocalLock, (mem: *mut c_void), *mut c_void, false);
+                    }
+                    "LocalUnlock" => {
+                        hook_func_with_check!($libname, $lib_ident, LocalUnlock, (mem: *mut c_void), bool, false);
+                    }
+                    "LocalSize" => {
+                        hook_func_with_check!($libname, $lib_ident, LocalSize, (mem: *mut c_void),usize, false);
+                    }
+                    "LocalFree" => {
+                        hook_func_with_check!($libname, $lib_ident, LocalFree, (mem: *mut c_void), *mut c_void, true);
+                    }
+                    "LocalFlags" => {
+                        hook_func_with_check!($libname, $lib_ident, LocalFlags, (mem: *mut c_void),u32, false);
+                    }
+                    "GlobalAlloc" => {
+                        hook_func!($libname, $lib_ident, GlobalAlloc, (flags: u32, size: usize), *mut c_void);
+                    }
+                    "GlobalReAlloc" => {
+                        hook_func!($libname, $lib_ident, GlobalReAlloc, (mem: *mut c_void, flags: u32, size: usize), *mut c_void);
+                    }
+                    "GlobalHandle" => {
+                        hook_func_with_check!($libname, $lib_ident, GlobalHandle, (mem: *mut c_void), *mut c_void, false);
+                    }
+                    "GlobalLock" => {
+                        hook_func_with_check!($libname, $lib_ident, GlobalLock, (mem: *mut c_void), *mut c_void, false);
+                    }
+                    "GlobalUnlock" => {
+                        hook_func_with_check!($libname, $lib_ident, GlobalUnlock, (mem: *mut c_void), bool, false);
+                    }
+                    "GlobalSize" => {
+                        hook_func_with_check!($libname, $lib_ident, GlobalSize, (mem: *mut c_void),usize, false);
+                    }
+                    "GlobalFree" => {
+                        hook_func_with_check!($libname, $lib_ident, GlobalFree, (mem: *mut c_void), *mut c_void, true);
+                    }
+                    "GlobalFlags" => {
+                        hook_func_with_check!($libname, $lib_ident, GlobalFlags, (mem: *mut c_void),u32, false);
+                    }
+                    "memmove" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            memmove,
+                            (dest: *mut c_void, src: *const c_void, n: usize),
+                            *mut c_void
+                        );
+                    }
+                    "memcpy" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            memcpy,
+                            (dest: *mut c_void, src: *const c_void, n: usize),
+                            *mut c_void
+                        );
+                    }
+                    "malloc" => {
+                        hook_func!($libname, $lib_ident, malloc, (size: usize), *mut c_void);
+                    }
+                    "_o_malloc" | "o_malloc" => {
+                        hook_func!($libname, $lib_ident, _o_malloc, (size: usize), *mut c_void);
+                    }
+                    "calloc" => {
+                        hook_func!($libname, $lib_ident, calloc, (nmemb: usize, size: usize), *mut c_void);
+                    }
+                    "_o_calloc" | "o_calloc" => {
+                        hook_func!($libname, $lib_ident, _o_calloc, (nmemb: usize, size: usize), *mut c_void);
+                    }
+                    "realloc" => {
+                        hook_func!($libname, $lib_ident, realloc, (ptr: *mut c_void, size: usize), *mut c_void);
+                    }
+                    "_o_realloc" | "o_realloc" => {
+                        hook_func!($libname, $lib_ident, _o_realloc, (ptr: *mut c_void, size: usize), *mut c_void);
+                    }
+                    "free" => {
+                        hook_func_with_check!($libname, $lib_ident, free, (ptr: *mut c_void), usize, true);
+                    }
+                    "_o_free" | "o_free" => {
+                        hook_func_with_check!($libname, $lib_ident, _o_free, (ptr: *mut c_void), usize, true);
+                    }
+                    "_write" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            _write,
+                            (fd: i32, buf: *const c_void, count: usize),
+                            usize
+                        );
+                    }
+                    "_read" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            _read,
+                            (fd: i32, buf: *mut c_void, count: usize),
+                            usize
+                        );
+                    }
+                    "MapViewOfFile" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            MapViewOfFile,
+                            (handle: *const c_void, desired_access: u32, file_offset_high: u32, file_offset_low: u32, size: usize),
+                            *const c_void
+                        );
+                    }
+                    "UnmapViewOfFile" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            UnmapViewOfFile,
+                            (ptr: *const c_void),
+                            bool
+                        );
+                    }
+                    "LoadLibraryExW" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            LoadLibraryExW,
+                            (path: *const c_void, file: usize, flags: i32),
+                            usize
+                        );
+                    }
+                    "LdrLoadDll" => {
+                        hook_func!(
+                            $libname, $lib_ident,
+                            LdrLoadDll,
+                            (search_path: *const c_void, charecteristics: *const u32, dll_name: *const c_void, base_address: *mut *const c_void),
+                            usize
+                        );
+                    }
+                    _ => (),
+                }
+            }}
+            }
+        }
+        #[cfg(windows)]
+        {
+            hook_heap_windows!("ntdll", ntdll);
+            hook_heap_windows!("win32u", win32u);
+            hook_heap_windows!("ucrtbase", ucrtbase);
+            hook_heap_windows!("kernelbase", kernelbase);
+            hook_heap_windows!("kernel32", kernel32);
+            hook_heap_windows!("msvcrt", msvcrt);
+            hook_heap_windows!("api-ms-win-crt-private-l1-1-0", api_ms_win1);
+            hook_heap_windows!("api-ms-win-crt-private-l1-1-0.dll", api_ms_win2);
+            hook_heap_windows!("api-ms-win-core-heap-l1-1-0", api_ms_heap1);
+            hook_heap_windows!("api-ms-win-core-heap-l2-1-0", api_ms_heap2);
+            hook_heap_windows!(
+                "api-ms-win-core-heap-obsolete-l1-1-0",
+                api_ms_heap2_obsolete
+            );
+            hook_heap_windows!("api-ms-win-core-memory-l1-1-0", api_ms_memory1);
+            hook_heap_windows!("VCRUNTIME140", VCRUNTIME140);
+        }
 
-        for libname in ["libc++.so", "libc++.so.1", "libc++_shared.so"] {
-            log::info!("Hooking c++ functions in {}", libname);
-            for export in Module::enumerate_exports(libname) {
+        /*
+        #[cfg(target_os = "linux")]
+        let cpp_libs = [
+            "libc++.so",
+            "libc++.so.1",
+            "libc++abi.so.1",
+            "libc++_shared.so",
+            "libstdc++.so",
+            "libstdc++.so.6",
+        ];
+
+        #[cfg(target_vendor = "apple")]
+        let cpp_libs = ["libc++.1.dylib", "libc++abi.dylib", "libsystem_c.dylib"];
+        */
+
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        macro_rules! hook_cpp {
+           ($libname:literal, $lib_ident:ident) => {
+            log::info!("Hooking c++ functions in {}", $libname);
+            if let Some(module) = process.find_module_by_name($libname) {
+            for export in module.enumerate_exports() {
                 match &export.name[..] {
                     "_Znam" => {
-                        hook_func!(Some(libname), _Znam, (size: usize), *mut c_void);
+                        hook_func!($libname, $lib_ident, _Znam, (size: usize), *mut c_void);
                     }
                     "_ZnamRKSt9nothrow_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZnamRKSt9nothrow_t,
                             (size: usize, _nothrow: *const c_void),
                             *mut c_void
@@ -629,7 +1137,7 @@ impl AsanRuntime {
                     }
                     "_ZnamSt11align_val_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZnamSt11align_val_t,
                             (size: usize, alignment: usize),
                             *mut c_void
@@ -637,18 +1145,18 @@ impl AsanRuntime {
                     }
                     "_ZnamSt11align_val_tRKSt9nothrow_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZnamSt11align_val_tRKSt9nothrow_t,
                             (size: usize, alignment: usize, _nothrow: *const c_void),
                             *mut c_void
                         );
                     }
                     "_Znwm" => {
-                        hook_func!(Some(libname), _Znwm, (size: usize), *mut c_void);
+                        hook_func!($libname, $lib_ident, _Znwm, (size: usize), *mut c_void);
                     }
                     "_ZnwmRKSt9nothrow_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZnwmRKSt9nothrow_t,
                             (size: usize, _nothrow: *const c_void),
                             *mut c_void
@@ -656,7 +1164,7 @@ impl AsanRuntime {
                     }
                     "_ZnwmSt11align_val_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZnwmSt11align_val_t,
                             (size: usize, alignment: usize),
                             *mut c_void
@@ -664,95 +1172,114 @@ impl AsanRuntime {
                     }
                     "_ZnwmSt11align_val_tRKSt9nothrow_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZnwmSt11align_val_tRKSt9nothrow_t,
                             (size: usize, alignment: usize, _nothrow: *const c_void),
                             *mut c_void
                         );
                     }
                     "_ZdaPv" => {
-                        hook_func!(Some(libname), _ZdaPv, (ptr: *mut c_void), ());
+                        hook_func!($libname, $lib_ident, _ZdaPv, (ptr: *mut c_void), usize);
                     }
                     "_ZdaPvm" => {
-                        hook_func!(Some(libname), _ZdaPvm, (ptr: *mut c_void, _ulong: u64), ());
+                        hook_func!($libname, $lib_ident, _ZdaPvm, (ptr: *mut c_void, _ulong: u64), usize);
                     }
                     "_ZdaPvmSt11align_val_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZdaPvmSt11align_val_t,
                             (ptr: *mut c_void, _ulong: u64, _alignment: usize),
-                            ()
+                            usize
                         );
                     }
                     "_ZdaPvRKSt9nothrow_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZdaPvRKSt9nothrow_t,
                             (ptr: *mut c_void, _nothrow: *const c_void),
-                            ()
+                            usize
                         );
                     }
                     "_ZdaPvSt11align_val_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZdaPvSt11align_val_t,
                             (ptr: *mut c_void, _alignment: usize),
-                            ()
+                            usize
                         );
                     }
                     "_ZdaPvSt11align_val_tRKSt9nothrow_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZdaPvSt11align_val_tRKSt9nothrow_t,
                             (ptr: *mut c_void, _alignment: usize, _nothrow: *const c_void),
-                            ()
+                            usize
                         );
                     }
                     "_ZdlPv" => {
-                        hook_func!(Some(libname), _ZdlPv, (ptr: *mut c_void), ());
+                        hook_func!($libname, $lib_ident, _ZdlPv, (ptr: *mut c_void), usize);
                     }
                     "_ZdlPvm" => {
-                        hook_func!(Some(libname), _ZdlPvm, (ptr: *mut c_void, _ulong: u64), ());
+                        hook_func!($libname, $lib_ident, _ZdlPvm, (ptr: *mut c_void, _ulong: u64), usize);
                     }
                     "_ZdlPvmSt11align_val_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZdlPvmSt11align_val_t,
                             (ptr: *mut c_void, _ulong: u64, _alignment: usize),
-                            ()
+                            usize
                         );
                     }
                     "_ZdlPvRKSt9nothrow_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZdlPvRKSt9nothrow_t,
                             (ptr: *mut c_void, _nothrow: *const c_void),
-                            ()
+                            usize
                         );
                     }
                     "_ZdlPvSt11align_val_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZdlPvSt11align_val_t,
                             (ptr: *mut c_void, _alignment: usize),
-                            ()
+                            usize
                         );
                     }
                     "_ZdlPvSt11align_val_tRKSt9nothrow_t" => {
                         hook_func!(
-                            Some(libname),
+                            $libname, $lib_ident,
                             _ZdlPvSt11align_val_tRKSt9nothrow_t,
                             (ptr: *mut c_void, _alignment: usize, _nothrow: *const c_void),
-                            ()
+                            usize
                         );
                     }
                     _ => {}
                 }
-            }
+            }}
+           }
         }
-        log::info!("Hooking libc functions");
+        #[cfg(target_os = "linux")]
+        {
+            hook_cpp!("libc++.so", libcpp);
+            hook_cpp!("libc++.so.1", libcpp1);
+            hook_cpp!("libc++.so.1", libcpp1);
+            hook_cpp!("libc++abi.so.1", libcppapi);
+            hook_cpp!("libc++_shared.so", libcppshared);
+            hook_cpp!("libstdc++.so", libstdcpp);
+            hook_cpp!("libstdc++.so.6", libstdcpp6);
+        }
+
+        #[cfg(target_vendor = "apple")]
+        {
+            hook_cpp!("libc++.1.dylib", libcpp_darwin);
+            hook_cpp!("libc++abi.dylib", libcppabi_darwin);
+            hook_cpp!("libsystem_c.dylib", libsystem_c_darwin);
+        }
+
+        #[cfg(not(windows))]
         hook_func!(
-            None,
+
             mmap,
             (
                 addr: *const c_void,
@@ -764,68 +1291,73 @@ impl AsanRuntime {
             ),
             *mut c_void
         );
-        hook_func!(None, munmap, (addr: *const c_void, length: usize), i32);
+        #[cfg(not(windows))]
+        hook_func!(munmap, (addr: *const c_void, length: usize), i32);
 
         // Hook libc functions which may access allocated memory
+        #[cfg(not(windows))]
         hook_func!(
-            None,
+
             write,
             (fd: i32, buf: *const c_void, count: usize),
             usize
         );
-        hook_func!(None, read, (fd: i32, buf: *mut c_void, count: usize), usize);
+        #[cfg(not(windows))]
+        hook_func!(read, (fd: i32, buf: *mut c_void, count: usize), usize);
         hook_func!(
-            None,
+
             fgets,
             (s: *mut c_void, size: u32, stream: *mut c_void),
             *mut c_void
         );
         hook_func!(
-            None,
+
             memcmp,
             (s1: *const c_void, s2: *const c_void, n: usize),
             i32
         );
         hook_func!(
-            None,
+
             memcpy,
             (dest: *mut c_void, src: *const c_void, n: usize),
             *mut c_void
         );
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(target_vendor = "apple", windows)))]
         hook_func!(
-            None,
+
             mempcpy,
             (dest: *mut c_void, src: *const c_void, n: usize),
             *mut c_void
         );
+        // #[cfg(not(windows))]
+        // hook_func!(
+        //     None,
+        //     memmove,
+        //     (dest: *mut c_void, src: *const c_void, n: usize),
+        //     *mut c_void
+        // );
         hook_func!(
-            None,
-            memmove,
-            (dest: *mut c_void, src: *const c_void, n: usize),
-            *mut c_void
-        );
-        hook_func!(
-            None,
+
             memset,
             (s: *mut c_void, c: i32, n: usize),
             *mut c_void
         );
         hook_func!(
-            None,
+
             memchr,
             (s: *mut c_void, c: i32, n: usize),
             *mut c_void
         );
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(target_vendor = "apple", windows)))]
         hook_func!(
-            None,
+
             memrchr,
             (s: *mut c_void, c: i32, n: usize),
             *mut c_void
         );
+        #[cfg(not(windows))]
         hook_func!(
-            None,
+
             memmem,
             (
                 haystack: *const c_void,
@@ -835,115 +1367,140 @@ impl AsanRuntime {
             ),
             *mut c_void
         );
-        #[cfg(not(target_os = "android"))]
-        hook_func!(None, bzero, (s: *mut c_void, n: usize), ());
-        #[cfg(not(any(target_os = "android", target_vendor = "apple")))]
-        hook_func!(None, explicit_bzero, (s: *mut c_void, n: usize), ());
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", windows)))]
+        hook_func!(bzero, (s: *mut c_void, n: usize), usize);
+        #[cfg(not(any(target_os = "android", target_vendor = "apple", windows)))]
+        hook_func!(explicit_bzero, (s: *mut c_void, n: usize),usize);
+        // #[cfg(not(any(target_os = "android", windows)))]
+        // hook_func!(
+        //     None,
+        //     bcmp,
+        //     (s1: *const c_void, s2: *const c_void, n: usize),
+        //     i32
+        // );
+        hook_func!(strchr, (s: *mut c_char, c: i32), *mut c_char);
+        hook_func!(strrchr, (s: *mut c_char, c: i32), *mut c_char);
+        #[cfg(not(windows))]
         hook_func!(
-            None,
-            bcmp,
-            (s1: *const c_void, s2: *const c_void, n: usize),
-            i32
-        );
-        hook_func!(None, strchr, (s: *mut c_char, c: i32), *mut c_char);
-        hook_func!(None, strrchr, (s: *mut c_char, c: i32), *mut c_char);
-        hook_func!(
-            None,
+
             strcasecmp,
             (s1: *const c_char, s2: *const c_char),
             i32
         );
+        #[cfg(not(windows))]
         hook_func!(
-            None,
+
             strncasecmp,
             (s1: *const c_char, s2: *const c_char, n: usize),
             i32
         );
         hook_func!(
-            None,
+
             strcat,
             (dest: *mut c_char, src: *const c_char),
             *mut c_char
         );
-        hook_func!(None, strcmp, (s1: *const c_char, s2: *const c_char), i32);
+        hook_func!(strcmp, (s1: *const c_char, s2: *const c_char), i32);
         hook_func!(
-            None,
+
             strncmp,
             (s1: *const c_char, s2: *const c_char, n: usize),
             i32
         );
         hook_func!(
-            None,
+
             strcpy,
             (dest: *mut c_char, src: *const c_char),
             *mut c_char
         );
         hook_func!(
-            None,
+
             strncpy,
             (dest: *mut c_char, src: *const c_char, n: usize),
             *mut c_char
         );
+        #[cfg(not(windows))]
         hook_func!(
-            None,
+
             stpcpy,
             (dest: *mut c_char, src: *const c_char),
             *mut c_char
         );
-        hook_func!(None, strdup, (s: *const c_char), *mut c_char);
-        hook_func!(None, strlen, (s: *const c_char), usize);
-        hook_func!(None, strnlen, (s: *const c_char, n: usize), usize);
+        #[cfg(not(windows))]
+        hook_func!(strdup, (s: *const c_char), *mut c_char);
+        #[cfg(windows)]
+        hook_func!(_strdup, (s: *const c_char), *mut c_char);
+        hook_func!(strlen, (s: *const c_char), usize);
+        hook_func!(strnlen, (s: *const c_char, n: usize), usize);
         hook_func!(
-            None,
+
             strstr,
             (haystack: *const c_char, needle: *const c_char),
             *mut c_char
         );
+        #[cfg(not(windows))]
         hook_func!(
-            None,
+
             strcasestr,
             (haystack: *const c_char, needle: *const c_char),
             *mut c_char
         );
-        hook_func!(None, atoi, (nptr: *const c_char), i32);
-        hook_func!(None, atol, (nptr: *const c_char), i32);
-        hook_func!(None, atoll, (nptr: *const c_char), i64);
-        hook_func!(None, wcslen, (s: *const wchar_t), usize);
+        hook_func!(atoi, (nptr: *const c_char), i32);
+        hook_func!(atol, (nptr: *const c_char), i32);
+        hook_func!(atoll, (nptr: *const c_char), i64);
+        hook_func!(wcslen, (s: *const wchar_t), usize);
         hook_func!(
-            None,
+
             wcscpy,
             (dest: *mut wchar_t, src: *const wchar_t),
             *mut wchar_t
         );
-        hook_func!(None, wcscmp, (s1: *const wchar_t, s2: *const wchar_t), i32);
+        hook_func!(wcscmp, (s1: *const wchar_t, s2: *const wchar_t), i32);
         #[cfg(target_vendor = "apple")]
         hook_func!(
-            None,
+
             memset_pattern4,
             (s: *mut c_void, c: *const c_void, n: usize),
             ()
         );
         #[cfg(target_vendor = "apple")]
         hook_func!(
-            None,
+
             memset_pattern8,
             (s: *mut c_void, c: *const c_void, n: usize),
             ()
         );
         #[cfg(target_vendor = "apple")]
         hook_func!(
-            None,
+
             memset_pattern16,
             (s: *mut c_void, c: *const c_void, n: usize),
             ()
         );
     }
 
+    /// Deregister all the hooks
+    fn deregister_hooks(&mut self, gum: &Gum) {
+        /*This is terrible code and should be replaced as soon as possible.
+
+        This is basically a bandaid solution that happens to work because 2 different Interceptor::obtains will return the same interceptor.
+
+        Ideally the interceptor should be stored in AsanRuntime, but because FridaRuntime has a 'static bound it becomes difficult to introduce that.
+        */
+        let mut interceptor = Interceptor::obtain(gum);
+        for hook in &self.hooks {
+            interceptor.revert(*hook);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
-    #[allow(clippy::cast_sign_loss)]
-    #[allow(clippy::too_many_lines)]
-    extern "C" fn handle_trap(&mut self) {
+    #[expect(clippy::cast_sign_loss)]
+    #[expect(clippy::too_many_lines)]
+    extern "system" fn handle_trap(&mut self) {
+        // log::error!("Attach the debugger to process {:#?}", std::process::id());
+        // std::thread::sleep(std::time::Duration::from_secs(30));
+        self.disable_hooks();
+
         self.dump_registers();
 
         let fault_address = self.regs[17];
@@ -958,7 +1515,10 @@ impl AsanRuntime {
         );
 
         let insn = instructions[0]; // This is the very instruction that has triggered fault
-        log::info!("{insn:#?}");
+        log::info!(
+            "Fault Instruction: {}",
+            insn.display_with(DisplayStyle::Intel).to_string()
+        );
         let operand_count = insn.operand_count();
 
         let mut access_type: Option<AccessType> = None;
@@ -1007,7 +1567,6 @@ impl AsanRuntime {
             };
 
             // log::trace!("{:x}", base_value);
-            #[allow(clippy::option_if_let_else)]
             let error = if fault_address >= stack_start && fault_address < stack_end {
                 match access_type {
                     Some(typ) => match typ {
@@ -1034,6 +1593,8 @@ impl AsanRuntime {
             } else if base_value.is_some() {
                 if let Some(metadata) = self
                     .allocator
+                    .lock()
+                    .unwrap()
                     .find_metadata(fault_address, base_value.unwrap())
                 {
                     match access_type {
@@ -1085,16 +1646,19 @@ impl AsanRuntime {
                     backtrace,
                 ))
             };
-            AsanErrors::get_mut().report_error(error);
+            #[allow(clippy::manual_assert)]
+            if AsanErrors::get_mut_blocking().report_error(error) {
+                panic!("ASAN: Crashing target!");
+            }
 
             // This is not even a mem instruction??
-        } else {
-            AsanErrors::get_mut().report_error(AsanError::Unknown((
-                self.regs,
-                actual_pc,
-                (None, None, 0, fault_address),
-                backtrace,
-            )));
+        } else if AsanErrors::get_mut_blocking().report_error(AsanError::Unknown((
+            self.regs,
+            actual_pc,
+            (None, None, 0, fault_address),
+            backtrace,
+        ))) {
+            panic!("ASAN: Crashing target!");
         }
 
         // log::info!("ASAN Error, attach the debugger!");
@@ -1102,12 +1666,14 @@ impl AsanRuntime {
         // std::thread::sleep(std::time::Duration::from_secs(60));
 
         // self.dump_registers();
+        self.enable_hooks();
     }
 
     #[cfg(target_arch = "aarch64")]
-    #[allow(clippy::cast_sign_loss)] // for displacement
-    #[allow(clippy::too_many_lines)]
-    extern "C" fn handle_trap(&mut self) {
+    #[expect(clippy::cast_sign_loss)] // for displacement
+    #[expect(clippy::too_many_lines)]
+    extern "system" fn handle_trap(&mut self) {
+        self.disable_hooks();
         let mut actual_pc = self.regs[31];
         actual_pc = match self.stalked_addresses.get(&actual_pc) {
             //get the pc associated with the trapped insn
@@ -1149,14 +1715,13 @@ impl AsanRuntime {
             }
         };
 
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         let fault_address =
             (self.regs[base_reg as usize] as isize + displacement as isize) as usize;
 
         let backtrace = Backtrace::new();
 
         let (stack_start, stack_end) = Self::current_stack();
-        #[allow(clippy::option_if_let_else)]
         let error = if fault_address >= stack_start && fault_address < stack_end {
             if insn.opcode.to_string().starts_with('l') {
                 AsanError::StackOobRead((
@@ -1185,6 +1750,8 @@ impl AsanRuntime {
             }
         } else if let Some(metadata) = self
             .allocator
+            .lock()
+            .unwrap()
             .find_metadata(fault_address, self.regs[base_reg as usize])
         {
             let asan_readwrite_error = AsanReadWriteError {
@@ -1223,11 +1790,15 @@ impl AsanRuntime {
                 backtrace,
             ))
         };
-        AsanErrors::get_mut().report_error(error);
+        #[allow(clippy::manual_assert)]
+        if AsanErrors::get_mut_blocking().report_error(error) {
+            panic!("ASAN: Crashing target!");
+        }
+        self.enable_hooks();
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[allow(clippy::unused_self)]
+    #[expect(clippy::unused_self)]
     fn register_idx(&self, reg: X86Register) -> Option<(u16, u16)> {
         match reg {
             X86Register::Eax => Some((0, 32)),
@@ -1289,404 +1860,11 @@ impl AsanRuntime {
         log::info!("instrumented rip: {:x}", self.regs[16]);
         log::info!("fault address: {:x}", self.regs[17]);
         log::info!("actual rip: {:x}", self.regs[18]);
-    }
-
-    // https://godbolt.org/z/oajhcP5sv
-    /*
-    #include <stdio.h>
-    #include <stdint.h>
-    uint8_t shadow_bit = 44;
-
-    uint64_t generate_shadow_check_function(uint64_t start, uint64_t size){
-        // calculate the shadow address
-        uint64_t addr = 0;
-        addr = addr + (start >> 3);
-        uint64_t mask = (1ULL << (shadow_bit + 1)) - 1;
-        addr = addr & mask;
-        addr = addr + (1ULL << shadow_bit);
-
-        if(size == 0){
-            // goto return_success
-            return 1;
-        }
-        else{
-            // check if the ptr is not aligned to 8 bytes
-            uint8_t remainder = start & 0b111;
-            if(remainder != 0){
-                // we need to test the high bits from the first shadow byte
-                uint8_t shift;
-                if(size < 8){
-                    shift = size;
-                }
-                else{
-                    shift = 8 - remainder;
-                }
-                // goto check_bits
-                uint8_t mask = (1 << shift) - 1;
-
-                // bitwise reverse for amd64 :<
-                // https://gist.github.com/yantonov/4359090
-                // we need 16bit number here, (not 8bit)
-                uint16_t val = *(uint16_t *)addr;
-                val = (val & 0xff00) >> 8 | (val & 0x00ff) << 8;
-                val = (val & 0xf0f0) >> 4 | (val & 0x0f0f) << 4;
-                val = (val & 0xcccc) >> 2 | (val & 0x3333) << 2;
-                val = (val & 0xaaaa) >> 1 | (val & 0x5555) << 1;
-                val = (val >> 8) | (val << 8); // swap the byte
-                val = (val >> remainder);
-                if((val & mask) != mask){
-                    // goto return failure
-                    return 0;
-                }
-
-                size = size - shift;
-                addr += 1;
-            }
-
-            // no_start_offset
-            uint64_t num_shadow_bytes = size >> 3;
-            uint64_t mask = -1;
-
-            while(true){
-                if(num_shadow_bytes < 8){
-                    // goto less_than_8_shadow_bytes_remaining
-                    break;
-                }
-                else{
-                    uint64_t val = *(uint64_t *)addr;
-                    addr += 8;
-                    if(val != mask){
-                        // goto return failure
-                        return 0;
-                    }
-                    num_shadow_bytes -= 8;
-                    size -= 64;
-                }
-            }
-
-            while(true){
-                if(num_shadow_bytes < 1){
-                    // goto check_trailing_bits
-                    break;
-                }
-                else{
-                    uint8_t val = *(uint8_t *)addr;
-                    addr += 1;
-                    if(val != 0xff){
-                        // goto return failure
-                        return 0;
-                    }
-                    num_shadow_bytes -= 1;
-                    size -= 8;
-                }
-            }
-
-            if(size == 0){
-                // goto return success
-                return 1;
-            }
-
-            uint8_t mask2 = ((1 << (size & 0b111)) - 1);
-            uint8_t val = *(uint8_t *)addr;
-            val = (val & 0xf0) >> 4 | (val & 0x0f) << 4;
-            val = (val & 0xff) >> 2 | (val & 0x33) << 2;
-            val = (val & 0xaa) >> 1 | (val & 0x55) << 1;
-
-            if((val & mask2) != mask2){
-                // goto return failure
-                return 0;
-            }
-            return 1;
-        }
-    }
-        */
-    #[cfg(target_arch = "x86_64")]
-    #[allow(clippy::unused_self, clippy::identity_op)]
-    #[allow(clippy::too_many_lines)]
-    fn generate_shadow_check_function(&mut self) {
-        use std::fs::File;
-
-        let shadow_bit = self.allocator.shadow_bit();
-        let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(0);
-
-        // Rdi start, Rsi size
-        dynasm!(ops
-        ;       .arch x64
-        ;        mov     cl, BYTE shadow_bit as i8
-        ;        mov     r10, -2
-        ;        shl     r10, cl
-        ;        mov     eax, 1
-        ;        mov     edx, 1
-        ;        shl     rdx, cl
-        ;        test    rsi, rsi
-        ;        je      >LBB0_15
-        ;        mov     rcx, rdi
-        ;        shr     rcx, 3
-        ;        not     r10
-        ;        and     r10, rcx
-        ;        add     r10, rdx
-        ;        and     edi, 7
-        ;        je      >LBB0_4
-        ;        mov     cl, 8
-        ;        sub     cl, dil
-        ;        cmp     rsi, 8
-        ;        movzx   ecx, cl
-        ;        mov     r8d, esi
-        ;        cmovae  r8d, ecx
-        ;        mov     r9d, -1
-        ;        mov     ecx, r8d
-        ;        shl     r9d, cl
-        ;        movzx   ecx, WORD [r10]
-        ;        rol     cx, 8
-        ;        mov     edx, ecx
-        ;        shr     edx, 4
-        ;        and     edx, 3855
-        ;        shl     ecx, 4
-        ;        and     ecx, -3856
-        ;        or      ecx, edx
-        ;        mov     edx, ecx
-        ;        shr     edx, 2
-        ;        and     edx, 13107
-        ;        and     ecx, -3277
-        ;        lea     ecx, [rdx + 4*rcx]
-        ;        mov     edx, ecx
-        ;        shr     edx, 1
-        ;        and     edx, 21845
-        ;        and     ecx, -10923
-        ;        lea     ecx, [rdx + 2*rcx]
-        ;        rol     cx, 8
-        ;        movzx   edx, cx
-        ;        mov     ecx, edi
-        ;        shr     edx, cl
-        ;        not     r9d
-        ;        movzx   ecx, r9b
-        ;        and     edx, ecx
-        ;        cmp     edx, ecx
-        ;        jne     >LBB0_11
-        ;        movzx   ecx, r8b
-        ;        sub     rsi, rcx
-        ;        add     r10, 1
-        ;LBB0_4:
-        ;        mov     r8, rsi
-        ;        shr     r8, 3
-        ;        mov     r9, r8
-        ;        and     r9, -8
-        ;        mov     edi, r8d
-        ;        and     edi, 7
-        ;        add     r9, r10
-        ;        and     esi, 63
-        ;        mov     rdx, r8
-        ;        mov     rcx, r10
-        ;LBB0_5:
-        ;        cmp     rdx, 7
-        ;        jbe     >LBB0_8
-        ;        add     rdx, -8
-        ;        cmp     QWORD [rcx], -1
-        ;        lea     rcx, [rcx + 8]
-        ;        je      <LBB0_5
-        ;        jmp     >LBB0_11
-        ;LBB0_8:
-        ;        lea     rcx, [8*rdi]
-        ;        sub     rsi, rcx
-        ;LBB0_9:
-        ;        test    rdi, rdi
-        ;        je      >LBB0_13
-        ;        add     rdi, -1
-        ;        cmp     BYTE [r9], -1
-        ;        lea     r9, [r9 + 1]
-        ;        je      <LBB0_9
-        ;LBB0_11:
-        ;        xor     eax, eax
-        ;        ret
-        ;LBB0_13:
-        ;        test    rsi, rsi
-        ;        je      >LBB0_15
-        ;        and     sil, 7
-        ;        mov     dl, -1
-        ;        mov     ecx, esi
-        ;        shl     dl, cl
-        ;        not     dl
-        ;        mov     cl, BYTE [r8 + r10]
-        ;        rol     cl, 4
-        ;        mov     eax, ecx
-        ;        shr     al, 2
-        ;        shl     cl, 2
-        ;        and     cl, -52
-        ;        or      cl, al
-        ;        mov     eax, ecx
-        ;        shr     al, 1
-        ;        and     al, 85
-        ;        add     cl, cl
-        ;        and     cl, -86
-        ;        or      cl, al
-        ;        and     cl, dl
-        ;        xor     eax, eax
-        ;        cmp     cl, dl
-        ;        sete    al
-        ;LBB0_15:
-        ;       ret
-            );
-        let blob = ops.finalize().unwrap();
-        unsafe {
-            let mapping = mmap::<File>(
-                None,
-                NonZeroUsize::new_unchecked(0x1000),
-                ProtFlags::all(),
-                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
-                None,
-                0,
-            )
-            .unwrap();
-            blob.as_ptr()
-                .copy_to_nonoverlapping(mapping as *mut u8, blob.len());
-            self.shadow_check_func = Some(std::mem::transmute(mapping as *mut u8));
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    // identity_op appears to be a false positive in ubfx
-    #[allow(clippy::unused_self, clippy::identity_op, clippy::too_many_lines)]
-    fn generate_shadow_check_function(&mut self) {
-        use std::fs::File;
-
-        let shadow_bit = self.allocator.shadow_bit();
-        let mut ops = dynasmrt::VecAssembler::<dynasmrt::aarch64::Aarch64Relocation>::new(0);
-        dynasm!(ops
-            ; .arch aarch64
-
-            // calculate the shadow address
-            ; mov x5, #0
-            // ; add x5, xzr, x5, lsl #shadow_bit
-            ; add x5, x5, x0, lsr #3
-            ; ubfx x5, x5, #0, #(shadow_bit + 1)
-            ; mov x6, #1
-            ; add x5, x5, x6, lsl #shadow_bit
-
-            ; cmp x1, #0
-            ; b.eq >return_success
-            // check if the ptr is not aligned to 8 bytes
-            ; ands x6, x0, #7
-            ; b.eq >no_start_offset
-
-            // we need to test the high bits from the first shadow byte
-            ; ldrh w7, [x5, #0]
-            ; rev16 w7, w7
-            ; rbit w7, w7
-            ; lsr x7, x7, #16
-            ; lsr x7, x7, x6
-
-            ; cmp x1, #8
-            ; b.lt >dont_fill_to_8
-            ; mov x2, #8
-            ; sub x6, x2, x6
-            ; b >check_bits
-            ; dont_fill_to_8:
-            ; mov x6, x1
-            ; check_bits:
-            ; mov x2, #1
-            ; lsl x2, x2, x6
-            ; sub x4, x2, #1
-
-            // if shadow_bits & size_to_test != size_to_test: fail
-            ; and x7, x7, x4
-            ; cmp x7, x4
-            ; b.ne >return_failure
-
-            // size -= size_to_test
-            ; sub x1, x1, x6
-            // shadow_addr += 1 (we consumed the initial byte in the above test)
-            ; add x5, x5, 1
-
-            ; no_start_offset:
-            // num_shadow_bytes = size / 8
-            ; lsr x4, x1, #3
-            ; eor x3, x3, x3
-            ; sub x3, x3, #1
-
-            // if num_shadow_bytes < 8; then goto check_bytes; else check_8_shadow_bytes
-            ; check_8_shadow_bytes:
-            ; cmp x4, #0x8
-            ; b.lt >less_than_8_shadow_bytes_remaining
-            ; ldr x7, [x5], #8
-            ; cmp x7, x3
-            ; b.ne >return_failure
-            ; sub x4, x4, #8
-            ; sub x1, x1, #64
-            ; b <check_8_shadow_bytes
-
-            ; less_than_8_shadow_bytes_remaining:
-            ; cmp x4, #1
-            ; b.lt >check_trailing_bits
-            ; ldrb w7, [x5], #1
-            ; cmp w7, #0xff
-            ; b.ne >return_failure
-            ; sub x4, x4, #1
-            ; sub x1, x1, #8
-            ; b <less_than_8_shadow_bytes_remaining
-
-            ; check_trailing_bits:
-            ; cmp x1, #0x0
-            ; b.eq >return_success
-
-            ; and x4, x1, #7
-            ; mov x2, #1
-            ; lsl x2, x2, x4
-            ; sub x4, x2, #1
-
-            ; ldrh w7, [x5, #0]
-            ; rev16 w7, w7
-            ; rbit w7, w7
-            ; lsr x7, x7, #16
-            ; and x7, x7, x4
-            ; cmp x7, x4
-            ; b.ne >return_failure
-
-            ; return_success:
-            ; mov x0, #1
-            ; b >prologue
-
-            ; return_failure:
-            ; mov x0, #0
-
-
-            ; prologue:
-            ; ret
-        );
-
-        let blob = ops.finalize().unwrap();
-
-        // apple aarch64 requires MAP_JIT to allocates WX pages
-        #[cfg(target_vendor = "apple")]
-        let map_flags = MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_JIT;
-        #[cfg(not(target_vendor = "apple"))]
-        let map_flags = MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE;
-
-        unsafe {
-            let mapping = mmap::<File>(
-                None,
-                NonZeroUsize::try_from(0x1000).unwrap(),
-                ProtFlags::all(),
-                map_flags,
-                None,
-                0,
-            )
-            .unwrap();
-
-            // on apple aarch64, WX pages can't be both writable and executable at the same time.
-            // pthread_jit_write_protect_np flips them from executable (1) to writable (0)
-            #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-            {
-                libc::pthread_jit_write_protect_np(0);
-            }
-
-            blob.as_ptr()
-                .copy_to_nonoverlapping(mapping as *mut u8, blob.len());
-
-            #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-            {
-                libc::pthread_jit_write_protect_np(1);
-            }
-            self.shadow_check_func = Some(std::mem::transmute(mapping as *mut u8));
+        log::info!("stack: ");
+        for i in 0..32 {
+            log::info!("{:x}", unsafe {
+                ((self.regs[5] + i * 8) as *const u64).read()
+            });
         }
     }
 
@@ -1696,126 +1874,125 @@ impl AsanRuntime {
     #include <stdint.h>
     uint8_t shadow_bit = 8;
     uint8_t bit = 3;
-    uint64_t generate_shadow_check_blob(uint64_t start){
+    uint64_t result = 0;
+    void handle_trap(uint64_t true_rip);
+    uint64_t generate_shadow_check_blob(uint64_t start, uint64_t true_rip){
+        uint64_t shadow_base = (1ULL << shadow_bit);
+        if (shadow_base * 3 > start || start >= shadow_base *4)
+            return 0;
+
         uint64_t addr = 0;
         addr = addr + (start >> 3);
         uint64_t mask = (1ULL << (shadow_bit + 1)) - 1;
+
         addr = addr & mask;
         addr = addr + (1ULL << shadow_bit);
 
         uint8_t remainder = start & 0b111;
         uint16_t val = *(uint16_t *)addr;
-        val = (val & 0xff00) >> 8 | (val & 0x00ff) << 8;
-        val = (val & 0xf0f0) >> 4 | (val & 0x0f0f) << 4;
-        val = (val & 0xcccc) >> 2 | (val & 0x3333) << 2;
-        val = (val & 0xaaaa) >> 1 | (val & 0x5555) << 1;
-        val = (val >> 8) | (val << 8); // swap the byte
         val = (val >> remainder);
 
         uint8_t mask2 = (1 << bit) - 1;
-        if((val & mask2) == mask2){
-            // success
-            return 0;
-        }
-        else{
+        if((val & mask2) != mask2){
             // failure
-            return 1;
+            handle_trap(true_rip);
         }
+        return 0;
+
     }
     */
+
+    /*
+
+    FRIDA ASAN IMPLEMENTATION DETAILS
+
+    The format of Frida's ASAN is signficantly different from LLVM ASAN.
+
+    In Frida ASAN, we attempt to find the lowest possible bit such that there is no mapping with that bit. That is to say, for some bit x, there is no mapping greater than
+    1 << x. This is our shadow base and is similar to Ultra compact shadow in LLVM ASAN. Unlike ASAN where 0 represents a poisoned byte and 1 represents an unpoisoned byte, in Frida-ASAN
+
+    The reasoning for this is that new pages are zeroed, so, by default, every qword is poisoned and we must explicitly unpoison any byte.
+
+    Much like LLVM ASAN, shadow bytes are qword based. This is to say that each shadow byte maps to one qword. The shadow calculation is as follows:
+    (1ULL << shadow_bit) | (address >> 3)
+
+    The format of a shadow bit is a bitmask. Each bit represents if a byte in the qword is valid starting from the first bit. So, something like 0b11100000 indicates that only the first 3 bytes in the associated qword are valid.
+
+    */
     #[cfg(target_arch = "x86_64")]
-    #[allow(clippy::unused_self)]
-    fn generate_shadow_check_blob(&mut self, bit: u32) -> Box<[u8]> {
-        let shadow_bit = self.allocator.shadow_bit();
-        // Rcx, Rax, Rdi, Rdx, Rsi are used, so we save them in emit_shadow_check
+    fn generate_shadow_check_blob(&mut self, size: u32) -> Box<[u8]> {
+        let shadow_bit = self.allocator_mut().shadow_bit();
+        // Rcx, Rax, Rdi, Rdx, Rsi, R8 are used, so we save them in emit_shadow_check
+        //at this point RDI contains the
+        let mask_shift = 32 - size;
         macro_rules! shadow_check{
             ($ops:ident, $bit:expr) => {dynasm!($ops
                 ;   .arch x64
-                ;   mov     cl, BYTE shadow_bit as i8
-                ;   mov     rax, -2
-                ;   shl     rax, cl
-                ;   mov     rdx, rdi
-                ;   shr     rdx, 3
-                ;   not     rax
-                ;   and     rax, rdx
-                ;   mov     edx, 1
-                ;   shl     rdx, cl
-                ;   movzx   eax, WORD [rax + rdx]
-                ;   rol     ax, 8
-                ;   mov     ecx, eax
-                ;   shr     ecx, 4
-                ;   and     ecx, 3855
-                ;   shl     eax, 4
-                ;   and     eax, -3856
-                ;   or      eax, ecx
-                ;   mov     ecx, eax
-                ;   shr     ecx, 2
-                ;   and     ecx, 13107
-                ;   and     eax, -3277
-                ;   lea     eax, [rcx + 4*rax]
-                ;   mov     ecx, eax
-                ;   shr     ecx, 1
-                ;   and     ecx, 21845
-                ;   and     eax, -10923
-                ;   lea     eax, [rcx + 2*rax]
-                ;   rol     ax, 8
-                ;   movzx   edx, ax
-                ;   and     dil, 7
-                ;   mov     ecx, edi
-                ;   shr     edx, cl
-                ;   mov     cl, BYTE bit as i8
-                ;   mov     eax, -1
-                ;   shl     eax, cl
-                ;   not     eax
-                ;   movzx   ecx, al
-                ;   and     edx, ecx
-                ;   xor     eax, eax
-                ;   cmp     edx, ecx
-                ;   je      >done
-                ;   lea     rsi, [>done] // leap 10 bytes forward
-                ;   nop // jmp takes 10 bytes at most so we want to allocate 10 bytes buffer (?)
-                ;   nop
-                ;   nop
-                ;   nop
-                ;   nop
-                ;   nop
-                ;   nop
-                ;   nop
-                ;   nop
-                ;   nop
+               // ; int3
+                ; mov     rdx, 1
+                ; shl     rdx, shadow_bit as i8 //rdx = shadow_base
+                ; mov rcx, rdi //copy address into rcx
+                ; and rcx, 7 //remainder
+                ; shr rdi, 3 //start >> 3
+                ; add rdi, rdx //shadow_base + (start >> 3)
+                ; mov edx, [rdi]  //load 4 shadow bytes. We load 4 just in case of an unaligned access
+                ; bswap edx  //bswap to get it into an acceptable form
+                ; shl edx, cl //this shifts by the unaligned access offset. why does x86 require cl...
+                ; mov edi, -1 //fill edi with all 1s
+                ; shl edi, mask_shift as i8 //edi now contains mask. this shl functionally creates a bitmask with the top `size` bits as 1s
+                ; and edx, edi //and it to see if the top bits are enabled in edx
+                ; cmp edx, edi //if the mask and the and'd value are the same, we're good
+                ; je      >done
+                ; lea     rsi, [>done] // leap 10 bytes forward
+                ; nop // jmp takes 10 bytes at most so we want to allocate 10 bytes buffer (?)
+                ; nop
+                ; nop
+                ; nop
+                ; nop
+                ; nop
+                ; nop
+                ; nop
+                ; nop
+                ; nop
                 ;done:
             );};
         }
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(0);
         shadow_check!(ops, bit);
         let ops_vec = ops.finalize().unwrap();
-        ops_vec[..ops_vec.len() - 10].to_vec().into_boxed_slice() //????
+        ops_vec[..ops_vec.len() - 10].to_vec().into_boxed_slice() //subtract 10 because we don't need the last nop
     }
 
     #[cfg(target_arch = "aarch64")]
-    #[allow(clippy::unused_self)]
-    fn generate_shadow_check_blob(&mut self, bit: u32) -> Box<[u8]> {
-        let shadow_bit = self.allocator.shadow_bit();
+    fn generate_shadow_check_blob(&mut self, width: u32) -> Box<[u8]> {
+        /*x0 contains the shadow address
+        x0 and x1 are saved by the asan_check
+        The maximum size this supports is up to 25 bytes. This is because we load 4 bytes of the shadow value. And, in the case that we have a misaligned address with an offset of 7 into the word. For example, if we load 25 bytes from 0x1007 - [0x1007,0x101f], then we require the shadow values from 0x1000, 0x1008, 0x1010, and 0x1018 */
+
+        let shadow_bit = self.allocator_mut().shadow_bit();
         macro_rules! shadow_check {
-            ($ops:ident, $bit:expr) => {dynasm!($ops
+            ($ops:ident, $width:expr) => {dynasm!($ops
                 ; .arch aarch64
-
+                //; brk #0xe
                 ; stp x2, x3, [sp, #-0x10]!
-                ; mov x1, #0
+                ; mov x1, xzr
                 // ; add x1, xzr, x1, lsl #shadow_bit
                 ; add x1, x1, x0, lsr #3
                 ; ubfx x1, x1, #0, #(shadow_bit + 1)
                 ; mov x2, #1
-                ; add x1, x1, x2, lsl #shadow_bit
-                ; ldrh w1, [x1, #0]
-                ; and x0, x0, #7
-                ; rev16 w1, w1
+                ; add x1, x1, x2, lsl #shadow_bit //x1 contains the offset of the shadow byte
+                ; ldr w1, [x1, #0] //w1 contains our shadow check
+                ; and x0, x0, #7 //x0 is the offset for unaligned accesses
+                ; rev32 x1, x1
                 ; rbit w1, w1
-                ; lsr x1, x1, #16
-                ; lsr x1, x1, x0
+                ; lsr w1, w1, w0 //x1 now contains our shadow value
                 ; ldp x2, x3, [sp], 0x10
-                ; tbnz x1, #$bit, >done
-
+                ; mov w0, #1
+                ; add w0, wzr, w0, LSL #$width
+                ; sub w0, w0, #1 //x0 now contains our bitmask
+                ; and w1, w0, w1 //and the bitmask and the shadow value
+                ; cmp w0, w1 //our bitmask and shadow & mask must be the same
+                ; b.eq >done
                 ; adr x1, >done
                 ; nop // will be replaced by b to report
                 ; done:
@@ -1823,38 +2000,43 @@ impl AsanRuntime {
         }
 
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::aarch64::Aarch64Relocation>::new(0);
-        shadow_check!(ops, bit);
+        shadow_check!(ops, width);
         let ops_vec = ops.finalize().unwrap();
-        ops_vec[..ops_vec.len() - 4].to_vec().into_boxed_slice()
+        ops_vec[..ops_vec.len() - 4].to_vec().into_boxed_slice() //we don't need the last nop so subtract by 4
     }
 
     #[cfg(target_arch = "aarch64")]
-    #[allow(clippy::unused_self)]
-    fn generate_shadow_check_exact_blob(&mut self, val: u64) -> Box<[u8]> {
-        let shadow_bit = self.allocator.shadow_bit();
+    fn generate_shadow_check_large_blob(&mut self, width: u32) -> Box<[u8]> {
+        //x0 contains the shadow address
+        //x0 and x1 are saved by the asan_check
+        //large blobs require 16 byte alignment as they are only possible with vector insns, so just abuse that
+
+        //This is used for checking shadow blobs that are larger than 25 bytes
+
+        assert!(width <= 64, "width must be <= 64");
+        let shift = 64 - width;
+        let shadow_bit = self.allocator_mut().shadow_bit();
         macro_rules! shadow_check_exact {
-            ($ops:ident, $val:expr) => {dynasm!($ops
+            ($ops:ident, $shift:expr) => {dynasm!($ops
                 ; .arch aarch64
 
                 ; stp x2, x3, [sp, #-0x10]!
-                ; mov x1, #0
+                ; mov x1, xzr
                 // ; add x1, xzr, x1, lsl #shadow_bit
                 ; add x1, x1, x0, lsr #3
                 ; ubfx x1, x1, #0, #(shadow_bit + 1)
                 ; mov x2, #1
                 ; add x1, x1, x2, lsl #shadow_bit
-                ; ldrh w1, [x1, #0]
-                ; and x0, x0, #7
-                ; rev16 w1, w1
-                ; rbit w1, w1
-                ; lsr x1, x1, #16
-                ; lsr x1, x1, x0
-                ; .dword -717536768 // 0xd53b4200 //mrs x0, NZCV
-                ; mov x2, $val
-                ; ands x1, x1, x2
+                ; ldr x1, [x1, #0] //x1 contains our shadow check
+                ; rev64 x1, x1
+                ; rbit x1, x1 //x1 now contains our shadow value
                 ; ldp x2, x3, [sp], 0x10
-                ; b.ne >done
-
+                ; mov x0, xzr
+                ; sub x0, x0, #1 //gives us all 1s
+                ; lsr x0, x0, #$shift //x0 now contains our bitmask
+                ; and x1, x0, x1 //and the bitmask and the shadow value and put it in x1
+                ; cmp x0, x1 //our bitmask and shadow & mask must be the same to ensure that the bytes are valid
+                ; b.eq >done
                 ; adr x1, >done
                 ; nop // will be replaced by b to report
                 ; done:
@@ -1862,7 +2044,7 @@ impl AsanRuntime {
         }
 
         let mut ops = dynasmrt::VecAssembler::<dynasmrt::aarch64::Aarch64Relocation>::new(0);
-        shadow_check_exact!(ops, val);
+        shadow_check_exact!(ops, shift);
         let ops_vec = ops.finalize().unwrap();
         ops_vec[..ops_vec.len() - 4].to_vec().into_boxed_slice()
     }
@@ -1871,16 +2053,13 @@ impl AsanRuntime {
     // Five registers, Rdi, Rsi, Rdx, Rcx, Rax are saved in emit_shadow_check before entering this function
     // So we retrieve them after saving other registers
     #[cfg(target_arch = "x86_64")]
-    #[allow(clippy::similar_names)]
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::too_many_lines)]
     fn generate_instrumentation_blobs(&mut self) {
         let mut ops_report = dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(0);
         dynasm!(ops_report
             ; .arch x64
             ; report:
             ; mov rdi, [>self_regs_addr] // load self.regs into rdi
-            ; mov [rdi + 0x80], rsi // return address is loaded into rsi in generate_shadow_check_blob
+            ; mov [rdi + 0x80], rsi // return address is loaded into rsi in generate_shadow_check_blob. rsi is the address of done
             ; mov [rdi + 0x8], rbx
             ; mov [rdi + 0x20], rbp
             ; mov [rdi + 0x28], rsp
@@ -1911,6 +2090,7 @@ impl AsanRuntime {
             ; mov [rsi + 0x38], rdi
 
             ; mov rdi, [>self_addr]
+            ; mov rcx, [>self_addr]
             ; mov rsi, [>trap_func]
 
             // Align the rsp to 16bytes boundary
@@ -1940,29 +2120,28 @@ impl AsanRuntime {
             // Ignore eh_frame_cie for amd64
             // See discussions https://github.com/AFLplusplus/LibAFL/pull/331
             ;->accessed_address:
-            ; .dword 0x0
+            ; .i32 0x0
             ; self_addr:
-            ; .qword core::ptr::from_mut(self) as *mut c_void as i64
+            ; .i64 core::ptr::from_mut(self) as *mut c_void as i64
             ; self_regs_addr:
-            ; .qword addr_of_mut!(self.regs) as i64
+            ; .i64 &raw mut self.regs as i64
             ; trap_func:
-            ; .qword AsanRuntime::handle_trap as *mut c_void as i64
+            ; .i64 AsanRuntime::handle_trap as *mut c_void as i64
         );
         self.blob_report = Some(ops_report.finalize().unwrap().into_boxed_slice());
 
         self.blob_check_mem_byte = Some(self.generate_shadow_check_blob(1));
         self.blob_check_mem_halfword = Some(self.generate_shadow_check_blob(2));
-        self.blob_check_mem_dword = Some(self.generate_shadow_check_blob(3));
-        self.blob_check_mem_qword = Some(self.generate_shadow_check_blob(4));
-        self.blob_check_mem_16bytes = Some(self.generate_shadow_check_blob(5));
+        self.blob_check_mem_dword = Some(self.generate_shadow_check_blob(4));
+        self.blob_check_mem_qword = Some(self.generate_shadow_check_blob(8));
+        self.blob_check_mem_16bytes = Some(self.generate_shadow_check_blob(16));
     }
 
     ///
     /// Generate the instrumentation blobs for the current arch.
     #[cfg(target_arch = "aarch64")]
-    #[allow(clippy::similar_names)] // We allow things like dword and qword
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::cast_possible_wrap)]
+    #[expect(clippy::unnecessary_semicolon)]
     fn generate_instrumentation_blobs(&mut self) {
         let mut ops_report = dynasmrt::VecAssembler::<dynasmrt::aarch64::Aarch64Relocation>::new(0);
         dynasm!(ops_report
@@ -1995,7 +2174,7 @@ impl AsanRuntime {
             ; mov x25, x1 // address of instrumented instruction.
             ; str x25, [x28, 0xf8]
 
-            ; .dword 0xd53b4218u32 as i32 // mrs x24, nzcv
+            ; .i32 0xd53b4218u32 as i32 // mrs x24, nzcv
             ; ldp x0, x1, [sp, 0x20]
             ; stp x0, x1, [x28]
 
@@ -2017,7 +2196,7 @@ impl AsanRuntime {
             ; ldr x1, >trap_func
             ; blr x1
 
-            ; .dword 0xd51b4218u32 as i32 // msr nzcv, x24
+            ; .i32 0xd51b4218u32 as i32 // msr nzcv, x24
             ; ldr x0, >self_regs_addr
             ; ldp x2, x3, [x0, #0x10]
             ; ldp x4, x5, [x0, #0x20]
@@ -2041,15 +2220,15 @@ impl AsanRuntime {
             ; br x1 // go back to the 'return address'
 
             ; self_addr:
-            ; .qword core::ptr::from_mut(self) as *mut c_void as i64
+            ; .i64 core::ptr::from_mut(self) as *mut c_void as i64
             ; self_regs_addr:
-            ; .qword addr_of_mut!(self.regs) as i64
+            ; .i64 &raw mut self.regs as i64
             ; trap_func:
-            ; .qword AsanRuntime::handle_trap as *mut c_void as i64
+            ; .i64 AsanRuntime::handle_trap as *mut c_void as i64
             ; register_frame_func:
-            ; .qword __register_frame as *mut c_void as i64
+            ; .i64 __register_frame as *mut c_void as i64
             ; eh_frame_cie_addr:
-            ; .qword addr_of_mut!(self.eh_frame) as i64
+            ; .i64 &raw mut self.eh_frame as i64
         );
         self.eh_frame = [
             0x14, 0, 0x00527a01, 0x011e7c01, 0x001f0c1b, //
@@ -2069,19 +2248,19 @@ impl AsanRuntime {
 
         self.blob_report = Some(ops_report.finalize().unwrap().into_boxed_slice());
 
-        self.blob_check_mem_byte = Some(self.generate_shadow_check_blob(0));
-        self.blob_check_mem_halfword = Some(self.generate_shadow_check_blob(1));
-        self.blob_check_mem_dword = Some(self.generate_shadow_check_blob(2));
-        self.blob_check_mem_qword = Some(self.generate_shadow_check_blob(3));
-        self.blob_check_mem_16bytes = Some(self.generate_shadow_check_blob(4));
+        self.blob_check_mem_byte = Some(self.generate_shadow_check_blob(1));
+        self.blob_check_mem_halfword = Some(self.generate_shadow_check_blob(2));
+        self.blob_check_mem_dword = Some(self.generate_shadow_check_blob(4));
+        self.blob_check_mem_qword = Some(self.generate_shadow_check_blob(8));
+        self.blob_check_mem_16bytes = Some(self.generate_shadow_check_blob(16));
 
-        self.blob_check_mem_3bytes = Some(self.generate_shadow_check_exact_blob(3));
-        self.blob_check_mem_6bytes = Some(self.generate_shadow_check_exact_blob(6));
-        self.blob_check_mem_12bytes = Some(self.generate_shadow_check_exact_blob(12));
-        self.blob_check_mem_24bytes = Some(self.generate_shadow_check_exact_blob(24));
-        self.blob_check_mem_32bytes = Some(self.generate_shadow_check_exact_blob(32));
-        self.blob_check_mem_48bytes = Some(self.generate_shadow_check_exact_blob(48));
-        self.blob_check_mem_64bytes = Some(self.generate_shadow_check_exact_blob(64));
+        self.blob_check_mem_3bytes = Some(self.generate_shadow_check_blob(3)); //the below are all possible with vector intrinsics
+        self.blob_check_mem_6bytes = Some(self.generate_shadow_check_blob(6));
+        self.blob_check_mem_12bytes = Some(self.generate_shadow_check_blob(12));
+        self.blob_check_mem_24bytes = Some(self.generate_shadow_check_blob(24));
+        self.blob_check_mem_32bytes = Some(self.generate_shadow_check_large_blob(32)); //this is possible with ldp q0, q1, [sp]. This must at least 16 byte aligned
+        self.blob_check_mem_48bytes = Some(self.generate_shadow_check_large_blob(48));
+        self.blob_check_mem_64bytes = Some(self.generate_shadow_check_large_blob(64));
     }
 
     /// Get the blob which implements the report funclet
@@ -2179,7 +2358,7 @@ impl AsanRuntime {
     #[cfg(target_arch = "aarch64")]
     #[must_use]
     #[inline]
-    #[allow(clippy::similar_names, clippy::type_complexity)]
+    #[expect(clippy::similar_names, clippy::type_complexity)]
     pub fn asan_is_interesting_instruction(
         decoder: InstDecoder,
         _address: u64,
@@ -2242,7 +2421,7 @@ impl AsanRuntime {
 
         // println!("{:?} {}", instr, memory_access_size);
         //abuse the fact that the last operand is always the mem operand
-        #[allow(clippy::let_and_return)]
+        #[expect(clippy::let_and_return)]
         match instr.operands[operands_len - 1] {
             Operand::RegRegOffset(reg1, reg2, size, shift, shift_size) => {
                 let ret = Some((
@@ -2276,16 +2455,23 @@ impl AsanRuntime {
     }
 
     /// Checks if the current instruction is interesting for address sanitization.
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(target_arch = "x86_64")]
     #[inline]
     #[must_use]
-    #[allow(clippy::result_unit_err)]
     pub fn asan_is_interesting_instruction(
         decoder: InstDecoder,
-        _address: u64,
+        address: u64,
         instr: &Insn,
     ) -> Option<(u8, X86Register, X86Register, u8, i32)> {
-        let cs_instr = frida_to_cs(decoder, instr);
+        let result = frida_to_cs(decoder, instr);
+
+        if let Err(e) = result {
+            log::error!("{}", e);
+            return None;
+        }
+
+        let cs_instr = result.unwrap();
+
         let mut operands = vec![];
         for operand_idx in 0..cs_instr.operand_count() {
             operands.push(cs_instr.operand(operand_idx));
@@ -2306,19 +2492,26 @@ impl AsanRuntime {
             return None;
         }
 
+        log::trace!("{:#x} {:#?} {:#?}", address, cs_instr, cs_instr.to_string());
+
         for operand in operands {
             if operand.is_memory() {
-                // log::trace!("{:#?}", operand)
+                // log::trace!("{:#?}", operand);
                 // if we reach this point
                 // because in x64 there's no mem to mem inst, just return the first memory operand
 
                 if let Some((basereg, indexreg, scale, disp)) = operand_details(&operand) {
-                    let memsz = cs_instr.mem_size().unwrap().bytes_size().unwrap(); // this won't fail if it is mem access inst
+                    // if the base register is rip, then it is a pc-relative access
+                    // and does not deal with dynamically allocated memory
+                    if basereg != X86Register::Rip {
+                        let memsz = cs_instr.mem_size().unwrap().bytes_size().unwrap(); // this won't fail if it is mem access inst
 
-                    // println!("{:#?} {:#?} {:#?}", cs_instr, cs_instr.to_string(), operand);
-                    // println!("{:#?}", (memsz, basereg, indexreg, scale, disp));
-
-                    return Some((memsz, basereg, indexreg, scale, disp));
+                        // println!("{:#?} {:#?} {:#?}", cs_instr, cs_instr.to_string(), operand);
+                        // println!("{:#?}", (memsz, basereg, indexreg, scale, disp));
+                        log::trace!("ASAN Interesting operand {:#?}", operand);
+                        log::trace!("{:#?}", (memsz, basereg, indexreg, scale, disp));
+                        return Some((memsz, basereg, indexreg, scale, disp));
+                    }
                 } // else {} // perhaps avx instructions?
             }
         }
@@ -2328,13 +2521,14 @@ impl AsanRuntime {
 
     /// Emits a asan shadow byte check.
     #[inline]
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
+    #[cfg(target_arch = "x86_64")]
     pub fn emit_shadow_check(
         &mut self,
         address: u64,
         output: &StalkerOutput,
+        instruction_size: usize,
         width: u8,
         basereg: X86Register,
         indexreg: X86Register,
@@ -2369,17 +2563,17 @@ impl AsanRuntime {
         {
             let after_report_impl = writer.code_offset() + 2;
 
-            #[cfg(target_arch = "x86_64")]
             writer.put_jmp_near_label(after_report_impl);
-            #[cfg(target_arch = "aarch64")]
-            writer.put_b_label(after_report_impl);
 
             self.current_report_impl = writer.pc();
-            #[cfg(unix)]
             writer.put_bytes(self.blob_report());
 
             writer.put_label(after_report_impl);
         }
+        // if disp == 0x102 {
+        //     log::trace!("BREAKING!");
+        //     writer.put_bytes(&[0xcc]);
+        // }
 
         /* Save registers that we'll use later in shadow_check_blob
                                         | addr  | rip   |
@@ -2396,7 +2590,8 @@ impl AsanRuntime {
         writer.put_push_reg(X86Register::Rdx);
         writer.put_push_reg(X86Register::Rcx);
         writer.put_push_reg(X86Register::Rax);
-
+        writer.put_push_reg(X86Register::Rbp);
+        writer.put_push_reg(X86Register::R8);
         /*
         Things are a bit different when Rip is either base register or index register.
         Suppose we have an instruction like
@@ -2410,14 +2605,15 @@ impl AsanRuntime {
         match basereg {
             Some(reg) => match reg {
                 X86Register::Rip => {
-                    writer.put_mov_reg_address(X86Register::Rdi, true_rip);
+                    writer
+                        .put_mov_reg_address(X86Register::Rdi, true_rip + instruction_size as u64);
                 }
                 X86Register::Rsp => {
                     // In this case rsp clobbered
                     writer.put_lea_reg_reg_offset(
                         X86Register::Rdi,
                         X86Register::Rsp,
-                        redzone_size + 0x8 * 6,
+                        redzone_size + 0x8 * 7,
                     );
                 }
                 _ => {
@@ -2432,18 +2628,19 @@ impl AsanRuntime {
         match indexreg {
             Some(reg) => match reg {
                 X86Register::Rip => {
-                    writer.put_mov_reg_address(X86Register::Rsi, true_rip);
+                    writer
+                        .put_mov_reg_address(X86Register::Rsi, true_rip + instruction_size as u64);
                 }
                 X86Register::Rdi => {
                     // In this case rdi is already clobbered, so we want it from the stack (we pushed rdi onto stack before!)
-                    writer.put_mov_reg_reg_offset_ptr(X86Register::Rsi, X86Register::Rsp, 0x20);
+                    writer.put_mov_reg_reg_offset_ptr(X86Register::Rsi, X86Register::Rsp, 0x30);
                 }
                 X86Register::Rsp => {
                     // In this case rsp is also clobbered
                     writer.put_lea_reg_reg_offset(
                         X86Register::Rsi,
                         X86Register::Rsp,
-                        redzone_size + 0x8 * 6,
+                        redzone_size + 0x8 * 7,
                     );
                 }
                 _ => {
@@ -2457,6 +2654,11 @@ impl AsanRuntime {
 
         // Scale
         if scale > 0 {
+            // if scale == 3 {
+            //     if let Some(X86Register::R8) = indexreg {
+            //         writer.put_bytes(&[0xcc]);
+            //     }
+            // }kernel
             writer.put_shl_reg_u8(X86Register::Rsi, scale);
         }
 
@@ -2468,7 +2670,6 @@ impl AsanRuntime {
         writer.put_push_reg(X86Register::Rsi); // save true_rip
         writer.put_push_reg(X86Register::Rdi); // save accessed_address
 
-        #[cfg(unix)]
         let checked: bool = match width {
             1 => writer.put_bytes(self.blob_check_mem_byte()),
             2 => writer.put_bytes(self.blob_check_mem_halfword()),
@@ -2485,11 +2686,15 @@ impl AsanRuntime {
                 // on amd64 jump can takes 10 bytes at most, so that's why I put 10 bytes.
                 writer.put_nop();
             }
+        } else {
+            log::trace!("Cannot check instructions for {:?} bytes.", width);
         }
 
         writer.put_pop_reg(X86Register::Rdi);
         writer.put_pop_reg(X86Register::Rsi);
 
+        writer.put_pop_reg(X86Register::R8);
+        writer.put_pop_reg(X86Register::Rbp);
         writer.put_pop_reg(X86Register::Rax);
         writer.put_pop_reg(X86Register::Rcx);
         writer.put_pop_reg(X86Register::Rdx);
@@ -2502,7 +2707,7 @@ impl AsanRuntime {
     /// Emit a shadow memory check into the instruction stream
     #[cfg(target_arch = "aarch64")]
     #[inline]
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    #[expect(clippy::too_many_lines, clippy::too_many_arguments)]
     pub fn emit_shadow_check(
         &mut self,
         _address: u64,
@@ -2517,7 +2722,7 @@ impl AsanRuntime {
             i32::try_from(frida_gum_sys::GUM_RED_ZONE_SIZE).is_ok(),
             "GUM_RED_ZONE_SIZE is bigger than i32::max"
         );
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         let redzone_size = frida_gum_sys::GUM_RED_ZONE_SIZE as i32;
         let writer = output.writer();
 
@@ -2609,13 +2814,14 @@ impl AsanRuntime {
 
                 if extender_encoding != -1 && shift_amount < 0b1000 {
                     // emit add extended register: https://developer.arm.com/documentation/ddi0602/latest/Base-Instructions/ADD--extended-register---Add--extended-register--
-                    #[allow(clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_sign_loss)]
                     writer.put_bytes(
                         &(0x8b210000 | ((extender_encoding as u32) << 13) | (shift_amount << 10))
                             .to_le_bytes(),
                     ); //add x0, x0, w1, [shift] #[amount]
                 } else if shift_encoding != -1 {
-                    #[allow(clippy::cast_sign_loss)]
+                    //https://developer.arm.com/documentation/ddi0602/2024-03/Base-Instructions/ADD--shifted-register---Add--shifted-register-- add shifted register
+                    #[expect(clippy::cast_sign_loss)]
                     writer.put_bytes(
                         &(0x8b010000 | ((shift_encoding as u32) << 22) | (shift_amount << 10))
                             .to_le_bytes(),
@@ -2629,7 +2835,7 @@ impl AsanRuntime {
                     Aarch64Register::X0,
                     Aarch64Register::X1,
                 );
-            };
+            }
         }
 
         let displacement = displacement
@@ -2639,10 +2845,9 @@ impl AsanRuntime {
                 0
             };
 
-        #[allow(clippy::comparison_chain)]
+        #[expect(clippy::comparison_chain)]
         if displacement < 0 {
             if displacement > -4096 {
-                #[allow(clippy::cast_sign_loss)]
                 let displacement = displacement.unsigned_abs();
                 // Subtract the displacement into x0
                 writer.put_sub_reg_reg_imm(
@@ -2651,7 +2856,6 @@ impl AsanRuntime {
                     u64::from(displacement),
                 );
             } else {
-                #[allow(clippy::cast_sign_loss)]
                 let displacement = displacement.unsigned_abs();
                 let displacement_hi = displacement / 4096;
                 let displacement_lo = displacement % 4096;
@@ -2660,10 +2864,10 @@ impl AsanRuntime {
                     Aarch64Register::X0,
                     Aarch64Register::X0,
                     u64::from(displacement_lo),
-                ); //sub x0, x0, #[displacement & 4095]
+                ); //sub x0, x0, #[displacement 4096]
             }
         } else if displacement > 0 {
-            #[allow(clippy::cast_sign_loss)]
+            #[expect(clippy::cast_sign_loss)]
             let displacement = displacement as u32;
             if displacement < 4096 {
                 // Add the displacement into x0
@@ -2675,12 +2879,12 @@ impl AsanRuntime {
             } else {
                 let displacement_hi = displacement / 4096;
                 let displacement_lo = displacement % 4096;
-                writer.put_bytes(&(0x91400000u32 | (displacement_hi << 10)).to_le_bytes());
+                writer.put_bytes(&(0x91400000u32 | (displacement_hi << 10)).to_le_bytes()); //add x0, x0, #[displacement/4096] LSL#12
                 writer.put_add_reg_reg_imm(
                     Aarch64Register::X0,
                     Aarch64Register::X0,
                     u64::from(displacement_lo),
-                );
+                ); //add x0, x0, #[displacement % 4096]
             }
         }
         // Insert the check_shadow_mem code blob
@@ -2729,7 +2933,7 @@ impl Default for AsanRuntime {
         Self {
             check_for_leaks_enabled: false,
             current_report_impl: 0,
-            allocator: Allocator::default(),
+            allocator: Mutex::new(Allocator::default()),
             regs: [0; ASAN_SAVE_REGISTER_COUNT],
             blob_report: None,
             blob_check_mem_byte: None,
@@ -2749,9 +2953,12 @@ impl Default for AsanRuntime {
             suppressed_addresses: Vec::new(),
             skip_ranges: Vec::new(),
             continue_on_error: false,
-            shadow_check_func: None,
             #[cfg(target_arch = "aarch64")]
             eh_frame: [0; ASAN_EH_FRAME_DWORD_COUNT],
+            pc: None,
+            hooks: Vec::new(),
+            hooks_enabled: false,
+            // thread_in_hook: ThreadLocal::new(|| Cell::new(false)),
         }
     }
 }

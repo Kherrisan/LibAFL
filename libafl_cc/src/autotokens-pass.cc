@@ -63,13 +63,6 @@
 
 #include <iostream>
 
-#define FATAL(x...)               \
-  do {                            \
-    fprintf(stderr, "FATAL: " x); \
-    exit(1);                      \
-                                  \
-  } while (0)
-
 using namespace llvm;
 
 namespace {
@@ -106,14 +99,13 @@ llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "AutoTokensPass", "v0.1",
           /* lambda to insert our pass into the pass pipeline. */
           [](PassBuilder &PB) {
-
-  #if LLVM_VERSION_MAJOR <= 13
-            using OptimizationLevel = typename PassBuilder::OptimizationLevel;
-  #endif
             PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel OL) {
-                  MPM.addPass(AutoTokensPass());
-                });
+                [](ModulePassManager &MPM, OptimizationLevel OL
+  #if LLVM_VERSION_MAJOR >= 20
+                   ,
+                   ThinOrFullLTOPhase Phase
+  #endif
+                ) { MPM.addPass(AutoTokensPass()); });
           }};
 }
 #else
@@ -497,6 +489,11 @@ bool AutoTokensPass::runOnModule(Module &M) {
           if (isMemcmp || isStrncmp || isStrncasecmp) {
             Value       *op2 = callInst->getArgOperand(2);
             ConstantInt *ilen = dyn_cast<ConstantInt>(op2);
+
+            if (!ilen) {
+              op2 = callInst->getArgOperand(1);
+              ilen = dyn_cast<ConstantInt>(op2);
+            }
 
             if (ilen) {
               uint64_t literalLength = optLen;

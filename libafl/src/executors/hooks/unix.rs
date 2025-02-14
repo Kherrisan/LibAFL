@@ -2,10 +2,10 @@
 #[cfg(unix)]
 pub mod unix_signal_handler {
     use alloc::{boxed::Box, string::String, vec::Vec};
-    use core::{mem::transmute, ptr::addr_of_mut};
+    use core::mem::transmute;
     use std::{io::Write, panic};
 
-    use libafl_bolts::os::unix_signals::{ucontext_t, Handler, Signal};
+    use libafl_bolts::os::unix_signals::{ucontext_t, Signal, SignalHandler};
     use libc::siginfo_t;
 
     use crate::{
@@ -18,8 +18,9 @@ pub mod unix_signal_handler {
         },
         feedbacks::Feedback,
         fuzzer::HasObjective,
-        inputs::{Input, UsesInput},
-        state::{HasCorpus, HasExecutions, HasSolutions},
+        inputs::Input,
+        observers::ObserversTuple,
+        state::{HasCurrentTestcase, HasExecutions, HasSolutions},
     };
 
     pub(crate) type HandlerFuncPtr = unsafe fn(
@@ -29,7 +30,7 @@ pub mod unix_signal_handler {
         data: *mut InProcessExecutorHandlerData,
     );
 
-    /// A handler that does nothing.
+    // A handler that does nothing.
     /*pub fn nop_handler(
         _signal: Signal,
         _info: &mut siginfo_t,
@@ -39,16 +40,24 @@ pub mod unix_signal_handler {
     }*/
 
     #[cfg(unix)]
-    impl Handler for InProcessExecutorHandlerData {
-        fn handle(
+    impl SignalHandler for InProcessExecutorHandlerData {
+        /// # Safety
+        /// This will access global state.
+        unsafe fn handle(
             &mut self,
             signal: Signal,
             info: &mut siginfo_t,
             context: Option<&mut ucontext_t>,
         ) {
             unsafe {
-                let data = addr_of_mut!(GLOBAL_STATE);
+                let data = &raw mut GLOBAL_STATE;
                 let in_handler = (*data).set_in_handler(true);
+
+                if in_handler {
+                    log::error!("We crashed inside a crash handler, but this should never happen!");
+                    libc::exit(56);
+                }
+
                 match signal {
                     Signal::SigUser2 | Signal::SigAlarm => {
                         if !(*data).timeout_handler.is_null() {
@@ -73,28 +82,36 @@ pub mod unix_signal_handler {
     }
 
     /// invokes the `post_exec` hook on all observer in case of panic
-    pub fn setup_panic_hook<E, EM, OF, Z>()
+    pub fn setup_panic_hook<E, EM, I, OF, S, Z>()
     where
-        E: HasObservers,
-        EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
-        E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        E: Executor<EM, I, S, Z> + HasObservers,
+        E::Observers: ObserversTuple<I, S>,
+        EM: EventFirer<I, S> + EventRestarter<S>,
+        OF: Feedback<EM, I, E::Observers, S>,
+        S: HasExecutions + HasSolutions<I> + HasCurrentTestcase<I>,
+        Z: HasObjective<Objective = OF>,
+        I: Input + Clone,
     {
         let old_hook = panic::take_hook();
         panic::set_hook(Box::new(move |panic_info| unsafe {
             old_hook(panic_info);
-            let data = addr_of_mut!(GLOBAL_STATE);
+            let data = &raw mut GLOBAL_STATE;
             let in_handler = (*data).set_in_handler(true);
+
+            if in_handler {
+                log::error!("We crashed inside a crash panic hook, but this should never happen!");
+                libc::exit(56);
+            }
+
             if (*data).is_valid() {
                 // We are fuzzing!
                 let executor = (*data).executor_mut::<E>();
-                let state = (*data).state_mut::<E::State>();
-                let input = (*data).take_current_input::<<E::State as UsesInput>::Input>();
+                let state = (*data).state_mut::<S>();
+                let input = (*data).take_current_input::<I>();
                 let fuzzer = (*data).fuzzer_mut::<Z>();
                 let event_mgr = (*data).event_mgr_mut::<EM>();
 
-                run_observers_and_save_state::<E, EM, OF, Z>(
+                run_observers_and_save_state::<E, EM, I, OF, S, Z>(
                     executor,
                     state,
                     input,
@@ -115,18 +132,20 @@ pub mod unix_signal_handler {
     /// # Safety
     /// Well, signal handling is not safe
     #[cfg(unix)]
-    #[allow(clippy::needless_pass_by_value)]
-    pub unsafe fn inproc_timeout_handler<E, EM, OF, Z>(
+    #[allow(clippy::needless_pass_by_value)] // nightly no longer requires this
+    pub unsafe fn inproc_timeout_handler<E, EM, I, OF, S, Z>(
         _signal: Signal,
         _info: &mut siginfo_t,
         _context: Option<&mut ucontext_t>,
         data: &mut InProcessExecutorHandlerData,
     ) where
-        E: HasObservers + HasInProcessHooks,
-        EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
-        E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        E: HasInProcessHooks<I, S> + HasObservers,
+        E::Observers: ObserversTuple<I, S>,
+        EM: EventFirer<I, S> + EventRestarter<S>,
+        OF: Feedback<EM, I, E::Observers, S>,
+        S: HasExecutions + HasSolutions<I> + HasCurrentTestcase<I>,
+        Z: HasObjective<Objective = OF>,
+        I: Input + Clone,
     {
         // this stuff is for batch timeout
         if !data.executor_ptr.is_null()
@@ -144,14 +163,14 @@ pub mod unix_signal_handler {
         }
 
         let executor = data.executor_mut::<E>();
-        let state = data.state_mut::<E::State>();
+        let state = data.state_mut::<S>();
         let event_mgr = data.event_mgr_mut::<EM>();
         let fuzzer = data.fuzzer_mut::<Z>();
-        let input = data.take_current_input::<<E::State as UsesInput>::Input>();
+        let input = data.take_current_input::<I>();
 
         log::error!("Timeout in fuzz run.");
 
-        run_observers_and_save_state::<E, EM, OF, Z>(
+        run_observers_and_save_state::<E, EM, I, OF, S, Z>(
             executor,
             state,
             input,
@@ -169,19 +188,20 @@ pub mod unix_signal_handler {
     ///
     /// # Safety
     /// Well, signal handling is not safe
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::needless_pass_by_value)]
-    pub unsafe fn inproc_crash_handler<E, EM, OF, Z>(
+    #[allow(clippy::needless_pass_by_value)] // nightly no longer requires this
+    pub unsafe fn inproc_crash_handler<E, EM, I, OF, S, Z>(
         signal: Signal,
         _info: &mut siginfo_t,
         _context: Option<&mut ucontext_t>,
         data: &mut InProcessExecutorHandlerData,
     ) where
-        E: Executor<EM, Z> + HasObservers,
-        EM: EventFirer<State = E::State> + EventRestarter<State = E::State>,
-        OF: Feedback<E::State>,
-        E::State: HasExecutions + HasSolutions + HasCorpus,
-        Z: HasObjective<Objective = OF, State = E::State>,
+        E: Executor<EM, I, S, Z> + HasObservers,
+        E::Observers: ObserversTuple<I, S>,
+        EM: EventFirer<I, S> + EventRestarter<S>,
+        OF: Feedback<EM, I, E::Observers, S>,
+        S: HasExecutions + HasSolutions<I> + HasCurrentTestcase<I>,
+        Z: HasObjective<Objective = OF>,
+        I: Input + Clone,
     {
         #[cfg(all(target_os = "android", target_arch = "aarch64"))]
         let _context = _context.map(|p| {
@@ -193,10 +213,10 @@ pub mod unix_signal_handler {
         if data.is_valid() {
             let executor = data.executor_mut::<E>();
             // disarms timeout in case of timeout
-            let state = data.state_mut::<E::State>();
+            let state = data.state_mut::<S>();
             let event_mgr = data.event_mgr_mut::<EM>();
             let fuzzer = data.fuzzer_mut::<Z>();
-            let input = data.take_current_input::<<E::State as UsesInput>::Input>();
+            let input = data.take_current_input::<I>();
 
             log::error!("Child crashed!");
 
@@ -204,20 +224,24 @@ pub mod unix_signal_handler {
                 let mut bsod = Vec::new();
                 {
                     let mut writer = std::io::BufWriter::new(&mut bsod);
-                    writeln!(writer, "input: {:?}", input.generate_name(0)).unwrap();
-                    libafl_bolts::minibsod::generate_minibsod(
+                    let _ = writeln!(writer, "input: {:?}", input.generate_name(None));
+                    let bsod = libafl_bolts::minibsod::generate_minibsod(
                         &mut writer,
                         signal,
                         _info,
                         _context.as_deref(),
-                    )
-                    .unwrap();
-                    writer.flush().unwrap();
+                    );
+                    if bsod.is_err() {
+                        log::error!("generate_minibsod failed");
+                    }
+                    let _ = writer.flush();
                 }
-                log::error!("{}", std::str::from_utf8(&bsod).unwrap());
+                if let Ok(r) = std::str::from_utf8(&bsod) {
+                    log::error!("{}", r);
+                }
             }
 
-            run_observers_and_save_state::<E, EM, OF, Z>(
+            run_observers_and_save_state::<E, EM, I, OF, S, Z>(
                 executor,
                 state,
                 input,
@@ -241,16 +265,20 @@ pub mod unix_signal_handler {
                     let mut bsod = Vec::new();
                     {
                         let mut writer = std::io::BufWriter::new(&mut bsod);
-                        libafl_bolts::minibsod::generate_minibsod(
+                        let bsod = libafl_bolts::minibsod::generate_minibsod(
                             &mut writer,
                             signal,
                             _info,
                             _context.as_deref(),
-                        )
-                        .unwrap();
-                        writer.flush().unwrap();
+                        );
+                        if bsod.is_err() {
+                            log::error!("generate_minibsod failed");
+                        }
+                        let _ = writer.flush();
                     }
-                    log::error!("{}", std::str::from_utf8(&bsod).unwrap());
+                    if let Ok(r) = std::str::from_utf8(&bsod) {
+                        log::error!("{}", r);
+                    }
                 }
             }
 
@@ -258,7 +286,7 @@ pub mod unix_signal_handler {
                 log::error!("Type QUIT to restart the child");
                 let mut line = String::new();
                 while line.trim() != "QUIT" {
-                    std::io::stdin().read_line(&mut line).unwrap();
+                    let _ = std::io::stdin().read_line(&mut line);
                 }
             }
 

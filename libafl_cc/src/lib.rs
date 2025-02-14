@@ -1,20 +1,5 @@
 //! Compiler Wrapper from `LibAFL`
 
-#![deny(rustdoc::broken_intra_doc_links)]
-#![deny(clippy::all)]
-#![deny(clippy::pedantic)]
-#![allow(
-    clippy::unreadable_literal,
-    clippy::type_repetition_in_bounds,
-    clippy::missing_errors_doc,
-    clippy::cast_possible_truncation,
-    clippy::used_underscore_binding,
-    clippy::ptr_as_ptr,
-    clippy::missing_panics_doc,
-    clippy::missing_docs_in_private_items,
-    clippy::module_name_repetitions,
-    clippy::unreadable_literal
-)]
 #![cfg_attr(not(test), warn(
     missing_debug_implementations,
     missing_docs,
@@ -27,14 +12,12 @@
 ))]
 #![cfg_attr(test, deny(
     missing_debug_implementations,
-    missing_docs,
     //trivial_casts,
     trivial_numeric_casts,
     unused_extern_crates,
     unused_import_braces,
     unused_qualifications,
     unused_must_use,
-    missing_docs,
     //unused_results
 ))]
 #![cfg_attr(
@@ -57,6 +40,7 @@
     )
 )]
 
+use core::str;
 use std::{path::Path, process::Command};
 
 pub mod ar;
@@ -146,12 +130,12 @@ impl Configuration {
         let output = output.to_str().unwrap();
 
         let new_filename = if let Some((filename, extension)) = output.split_once('.') {
-            if let crate::Configuration::Default = self {
+            if let Configuration::Default = self {
                 format!("{filename}.{extension}")
             } else {
                 format!("{filename}.{self}.{extension}")
             }
-        } else if let crate::Configuration::Default = self {
+        } else if let Configuration::Default = self {
             output.to_string()
         } else {
             format!("{output}.{self}")
@@ -240,7 +224,6 @@ pub trait ToolWrapper {
     fn command(&mut self) -> Result<Vec<String>, Error>;
 
     /// Command to run the compiler for a given `Configuration`
-    #[allow(clippy::too_many_lines)]
     fn command_for_configuration(
         &mut self,
         configuration: Configuration,
@@ -340,4 +323,34 @@ pub trait CompilerWrapper: ToolWrapper {
     fn link_staticlib<S>(&mut self, dir: &Path, name: S) -> &'_ mut Self
     where
         S: AsRef<str>;
+
+    /// Finds the current `python3` version and adds `-lpython3.<version>` as linker argument.
+    /// Useful for fuzzers that need libpython, such as `nautilus`-based fuzzers.
+    fn link_libpython(&mut self) -> Result<&'_ mut Self, String> {
+        Ok(self.add_link_arg(format!("-l{}", find_python3_version()?)))
+    }
+}
+
+/// Helper function to find the current python3 version, if you need this information at link time.
+/// Example output: `python3.11`
+/// Example use: `.add_link_arg(format!("-l{}", find_python3_version()?))`
+/// Hint: you can use `link_libpython()` directly.
+fn find_python3_version() -> Result<String, String> {
+    match Command::new("python3").arg("--version").output() {
+        Ok(output) => {
+            let python_version = str::from_utf8(&output.stdout).unwrap_or_default().trim();
+            if python_version.is_empty() {
+                return Err("Empty return from python3 --version".to_string());
+            }
+            let version = python_version.split("Python 3.").nth(1).ok_or_else(|| {
+                format!("Could not find Python 3 in version string: {python_version}")
+            })?;
+            let mut version = version.split('.');
+            let version = version.next().ok_or_else(|| {
+                format!("Could not split python3 version string {python_version}")
+            })?;
+            Ok(format!("python3.{version}"))
+        }
+        Err(err) => Err(format!("Could not execute python3 --version: {err:?}")),
+    }
 }

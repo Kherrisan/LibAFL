@@ -1,35 +1,36 @@
 //! # Concolic Tracing Serialization Format
+//!
 //! ## Design Goals
 //! * The serialization format for concolic tracing was developed with the goal of being space and time efficient.
 //! * Additionally, it should be easy to maintain and extend.
 //! * It does not have to be compatible with other programming languages.
 //! * It should be resilient to crashes. Since we are fuzzing, we are expecting the traced program to crash at some
-//! point.
+//!   point.
 //!
 //! The format as implemented fulfils these design goals.
 //! Specifically:
 //! * it requires only constant memory space for serialization, which allows for tracing complex and/or
-//! long-running programs.
+//!   long-running programs.
 //! * the trace itself requires little space. A typical binary operation (such as an add) typically takes just 3 bytes.
 //! * it easy to encode. There is no translation between the interface of the runtime itself and the trace it generates.
 //! * it is similarly easy to decode and can be easily translated into an in-memory AST without overhead, because
-//! expressions are decoded from leaf to root instead of root to leaf.
+//!   expressions are decoded from leaf to root instead of root to leaf.
 //! * At its core, it is just [`SymExpr`]s, which can be added to, modified and removed from with ease. The
-//! definitions are automatically shared between the runtime and the consuming program, since both depend on the same
-//! `LibAFL`.
+//!   definitions are automatically shared between the runtime and the consuming program, since both depend on the same
+//!   `LibAFL`.
 //!
 //! ## Techniques
 //! The serialization format applies multiple techniques to achieve its goals.
 //! * It uses bincode for efficient binary serialization. Crucially, bincode uses variable length integer encoding,
-//! allowing it encode small integers use fewer bytes.
+//!   allowing it encode small integers use fewer bytes.
 //! * References to previous expressions are stored relative to the current expressions id. The vast majority of
-//! expressions refer to other expressions that were defined close to their use. Therefore, encoding relative references
-//! keeps references small. Therefore, they make optimal use of bincodes variable length integer encoding.
+//!   expressions refer to other expressions that were defined close to their use. Therefore, encoding relative references
+//!   keeps references small. Therefore, they make optimal use of bincodes variable length integer encoding.
 //! * Ids of expressions ([`SymExprRef`]s) are implicitly derived by their position in the message stream. Effectively,
-//! a counter is used to identify expressions.
+//!   a counter is used to identify expressions.
 //! * The current length of the trace in bytes in serialized in a fixed format at the beginning of the trace.
-//! This length is updated regularly when the trace is in a consistent state. This allows the reader to avoid reading
-//! malformed data if the traced process crashed.
+//!   This length is updated regularly when the trace is in a consistent state. This allows the reader to avoid reading
+//!   malformed data if the traced process crashed.
 //!
 //! ## Example
 //! The expression `SymExpr::BoolAnd { a: SymExpr::True, b: SymExpr::False }` would be encoded as:
@@ -40,8 +41,6 @@
 //! 5. 1 byte to reference b
 //!
 //! ... making for a total of 5 bytes.
-
-#![cfg(feature = "std")]
 
 use std::{
     fmt::{self, Debug, Formatter},
@@ -93,7 +92,7 @@ impl<R: Read> MessageFileReader<R> {
                 Some(Ok((message_id, message)))
             }
             Err(e) => match *e {
-                bincode::ErrorKind::Io(ref io_err) => match io_err.kind() {
+                ErrorKind::Io(ref io_err) => match io_err.kind() {
                     io::ErrorKind::UnexpectedEof => None,
                     _ => Some(Err(e)),
                 },
@@ -110,13 +109,14 @@ impl<R: Read> MessageFileReader<R> {
 
     /// This transforms the given message from it's serialized form into its in-memory form, making relative references
     /// absolute and counting the `SymExprRef`s.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn transform_message(&mut self, message: &mut SymExpr) -> SymExprRef {
         let ret = self.current_id;
         match message {
             SymExpr::InputByte { .. }
             | SymExpr::Integer { .. }
             | SymExpr::Integer128 { .. }
+            | SymExpr::IntegerFromBuffer { .. }
             | SymExpr::Float { .. }
             | SymExpr::NullPointer
             | SymExpr::True
@@ -219,7 +219,7 @@ impl<R: Read> MessageFileReader<R> {
 
 /// A `MessageFileWriter` writes a stream of [`SymExpr`] to any [`Write`]. For each written expression, it returns
 /// a [`SymExprRef`] which should be used to refer back to it.
-pub struct MessageFileWriter<W: Write> {
+pub struct MessageFileWriter<W> {
     id_counter: usize,
     writer: W,
     writer_start_position: u64,
@@ -242,7 +242,7 @@ impl<W: Write + Seek> MessageFileWriter<W> {
     /// Create a `MessageFileWriter` from the given [`Write`].
     pub fn from_writer(mut writer: W) -> io::Result<Self> {
         let writer_start_position = writer.stream_position()?;
-        // write dummy trace length
+        // write preliminary trace length
         writer.write_all(&0_u64.to_le_bytes())?;
         Ok(Self {
             id_counter: 1,
@@ -283,13 +283,14 @@ impl<W: Write + Seek> MessageFileWriter<W> {
 
     /// Writes a message to the stream and returns the [`SymExprRef`] that should be used to refer back to this message.
     /// May error when the underlying `Write` errors or when there is a serialization error.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn write_message(&mut self, mut message: SymExpr) -> Result<SymExprRef> {
         let current_id = self.id_counter;
         match &mut message {
             SymExpr::InputByte { .. }
             | SymExpr::Integer { .. }
             | SymExpr::Integer128 { .. }
+            | SymExpr::IntegerFromBuffer { .. }
             | SymExpr::Float { .. }
             | SymExpr::NullPointer
             | SymExpr::True
@@ -395,7 +396,7 @@ impl<W: Write + Seek> MessageFileWriter<W> {
     }
 }
 
-use libafl_bolts::shmem::{ShMem, ShMemCursor, ShMemProvider, StdShMemProvider};
+use libafl_bolts::shmem::{ShMem, ShMemCursor, ShMemProvider, StdShMem, StdShMemProvider};
 
 /// The default environment variable name to use for the shared memory used by the concolic tracing
 pub const DEFAULT_ENV_NAME: &str = "SHARED_MEMORY_MESSAGES";
@@ -438,14 +439,17 @@ impl<'buffer> MessageFileReader<Cursor<&'buffer [u8]>> {
     }
 }
 
-impl<T: ShMem> MessageFileWriter<ShMemCursor<T>> {
+impl<SHM> MessageFileWriter<ShMemCursor<SHM>>
+where
+    SHM: ShMem,
+{
     /// Creates a new `MessageFileWriter` from the given [`ShMemCursor`].
-    pub fn from_shmem(shmem: T) -> io::Result<Self> {
+    pub fn from_shmem(shmem: SHM) -> io::Result<Self> {
         Self::from_writer(ShMemCursor::new(shmem))
     }
 }
 
-impl MessageFileWriter<ShMemCursor<<StdShMemProvider as ShMemProvider>::ShMem>> {
+impl MessageFileWriter<ShMemCursor<StdShMem>> {
     /// Creates a new `MessageFileWriter` by reading a [`ShMem`] from the given environment variable.
     pub fn from_stdshmem_env_with_name(env_name: impl AsRef<str>) -> io::Result<Self> {
         Self::from_shmem(
@@ -463,8 +467,7 @@ impl MessageFileWriter<ShMemCursor<<StdShMemProvider as ShMemProvider>::ShMem>> 
 }
 
 /// A writer that will write messages to a shared memory buffer.
-pub type StdShMemMessageFileWriter =
-    MessageFileWriter<ShMemCursor<<StdShMemProvider as ShMemProvider>::ShMem>>;
+pub type StdShMemMessageFileWriter<SHM> = MessageFileWriter<ShMemCursor<SHM>>;
 
 #[cfg(test)]
 mod serialization_tests {
